@@ -1,0 +1,41 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Root instruction / temp files
+*.log
+*.err
+*.tmp
+*.temp
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Backend runtime data
+backend/data/
+backend/*.log
+backend/*.err
+*.db
+*.sqlite
+*.sqlite3
+
+# Node / frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/*.log
+frontend/*.err
+
+# Env / secrets
+.env
+.env.*
+!.env.example
