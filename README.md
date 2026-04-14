@@ -243,26 +243,6 @@ python -m compileall app
 
 可能是管理员已经在后台关闭了“允许普通用户注册”。
 
-### 3. 为什么上传到 GitHub 前要排除数据库？
-
-因为 `backend/data/app.db` 中包含：
-
-- 用户数据
-- 聊天记录
-- 图片内容
-- 供应商真实 API Key
-
-## 开源建议
-
-在上传 GitHub 之前，建议再次检查：
-
-- 不要提交 `backend/data/app.db`
-- 不要提交日志文件
-- 不要提交真实 API Key
-- 不要提交本地调试产生的临时文件
-
-本仓库根目录 `.gitignore` 已包含这些常见忽略项。
-
 ## License
 
 本项目使用 `Apache-2.0` 开源许可证，详见根目录 `LICENSE` 文件。
