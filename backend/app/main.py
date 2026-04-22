@@ -23,7 +23,7 @@ from app.chat_service import (
     prepare_stream_chat,
     rollback_stream_chat,
 )
-from app import chat_service, db
+from app import db
 from app.auth import (
     create_session,
     ensure_other_enabled_admin_exists,
@@ -103,6 +103,7 @@ class ProviderPayload(BaseModel):
     model_name: str = Field(min_length=1, max_length=128)
     supports_thinking: bool = True
     supports_vision: bool = False
+    supports_tool_calling: bool = False
     thinking_effort: str = "high"
     max_context_window: int = 256000
     max_output_tokens: int = 32000
@@ -171,6 +172,7 @@ def ensure_tables() -> None:
                 model_name TEXT NOT NULL,
                 supports_thinking INTEGER NOT NULL DEFAULT 1,
                 supports_vision INTEGER NOT NULL DEFAULT 0,
+                supports_tool_calling INTEGER NOT NULL DEFAULT 0,
                 thinking_effort TEXT NOT NULL DEFAULT 'high',
                 max_context_window INTEGER NOT NULL DEFAULT 256000,
                 max_output_tokens INTEGER NOT NULL DEFAULT 32000,
@@ -214,6 +216,13 @@ def ensure_tables() -> None:
         if "is_enabled" not in columns:
             conn.execute(
                 "ALTER TABLE users ADD COLUMN is_enabled INTEGER NOT NULL DEFAULT 1"
+            )
+        provider_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(providers)").fetchall()
+        }
+        if "supports_tool_calling" not in provider_columns:
+            conn.execute(
+                "ALTER TABLE providers ADD COLUMN supports_tool_calling INTEGER NOT NULL DEFAULT 0"
             )
 
         default_settings = {
@@ -332,6 +341,7 @@ def provider_public(row: sqlite3.Row) -> dict[str, Any]:
         "model_name": row["model_name"],
         "supports_thinking": bool(row["supports_thinking"]),
         "supports_vision": bool(row["supports_vision"]),
+        "supports_tool_calling": bool(row["supports_tool_calling"]),
         "thinking_effort": row["thinking_effort"],
         "max_context_window": row["max_context_window"],
         "max_output_tokens": row["max_output_tokens"],
@@ -553,8 +563,9 @@ def create_provider(
             """
             INSERT INTO providers (
                 name, api_url, api_key, model_name, supports_thinking, supports_vision,
-                thinking_effort, max_context_window, max_output_tokens, is_enabled, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                supports_tool_calling, thinking_effort, max_context_window, max_output_tokens,
+                is_enabled, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 payload.name.strip(),
@@ -563,6 +574,7 @@ def create_provider(
                 payload.model_name.strip(),
                 int(payload.supports_thinking),
                 int(payload.supports_vision),
+                int(payload.supports_tool_calling),
                 payload.thinking_effort,
                 payload.max_context_window,
                 payload.max_output_tokens,
@@ -595,7 +607,8 @@ def update_provider(
             """
             UPDATE providers
             SET name = ?, api_url = ?, api_key = ?, model_name = ?, supports_thinking = ?, supports_vision = ?,
-                thinking_effort = ?, max_context_window = ?, max_output_tokens = ?, is_enabled = ?, updated_at = ?
+                supports_tool_calling = ?, thinking_effort = ?, max_context_window = ?, max_output_tokens = ?,
+                is_enabled = ?, updated_at = ?
             WHERE id = ?
             """,
             (
@@ -605,6 +618,7 @@ def update_provider(
                 payload.model_name.strip(),
                 int(payload.supports_thinking),
                 int(payload.supports_vision),
+                int(payload.supports_tool_calling),
                 payload.thinking_effort,
                 payload.max_context_window,
                 payload.max_output_tokens,
@@ -960,73 +974,6 @@ async def stream_message(
                 },
             }
             yield json.dumps(initial, ensure_ascii=False) + "\n"
-            if context.search_tool:
-                activity_id = f"tool-{context.conversation_id}-1"
-                yield (
-                    json.dumps(
-                        {
-                            "type": "activity",
-                            "activity": {
-                                "id": activity_id,
-                                "kind": "tool",
-                                "label": context.search_tool["label"],
-                                "status": "running",
-                                "detail": "正在执行搜索",
-                            },
-                        },
-                        ensure_ascii=False,
-                    )
-                    + "\n"
-                )
-                try:
-                    tool_result = await asyncio.to_thread(
-                        chat_service.execute_search_tool,
-                        context.search_tool["name"],
-                        context.search_query_text,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    detail = (
-                        exc.detail
-                        if isinstance(exc, HTTPException)
-                        else str(exc) or "搜索工具执行失败"
-                    )
-                    yield (
-                        json.dumps(
-                            {
-                                "type": "activity",
-                                "activity": {
-                                    "id": activity_id,
-                                    "kind": "tool",
-                                    "label": context.search_tool["label"],
-                                    "status": "error",
-                                    "detail": detail,
-                                },
-                            },
-                            ensure_ascii=False,
-                        )
-                        + "\n"
-                    )
-                    raise
-                chat_service.inject_search_result_into_request_payload(
-                    context.request_payload, tool_result
-                )
-                yield (
-                    json.dumps(
-                        {
-                            "type": "activity",
-                            "activity": {
-                                "id": activity_id,
-                                "kind": "tool",
-                                "label": tool_result["label"],
-                                "status": "done",
-                                "detail": tool_result.get("detail"),
-                                "output": tool_result.get("output"),
-                            },
-                        },
-                        ensure_ascii=False,
-                    )
-                    + "\n"
-                )
             async for line in stream_provider_events(
                 context.provider, context.request_payload
             ):
@@ -1062,7 +1009,19 @@ async def stream_message(
                     )
                     raise RuntimeError(detail)
 
-                if event_type == "content_block_delta":
+                if event_type == "content_block_start":
+                    content_block = data.get("content_block")
+                    if (
+                        isinstance(content_block, dict)
+                        and content_block.get("type") == "tool_use"
+                    ):
+                        tool_name = content_block.get("name")
+                        tool_suffix = f": {tool_name}" if tool_name else ""
+                        raise RuntimeError(
+                            "供应商返回了未实现的 tool_use 事件"
+                            f"{tool_suffix}，当前无法继续此轮对话"
+                        )
+                elif event_type == "content_block_delta":
                     delta = data.get("delta", {})
                     text = delta.get("text")
                     thinking = delta.get("thinking")

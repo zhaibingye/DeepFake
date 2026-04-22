@@ -70,6 +70,7 @@ const defaultProviderForm = {
   model_name: '',
   supports_thinking: true,
   supports_vision: false,
+  supports_tool_calling: false,
   thinking_effort: 'high' as ThinkingEffort,
   max_context_window: 256000,
   max_output_tokens: 32000,
@@ -379,6 +380,7 @@ function App() {
     activeConversation ?? conversations.find((conversation) => conversation.id === activeConversationId) ?? null
   const currentConversationProvider =
     providers.find((provider) => provider.id === currentConversation?.provider_id) ?? null
+  const selectedProviderSupportsToolCalling = Boolean(selectedProvider?.supports_tool_calling)
   const selectedSearchProviderStatus = searchProviders?.[searchProvider] ?? null
   const isAdminRoute = route === 'admin'
   const hasVisibleConversation = messages.length > 0 || !!pendingUserMessage || !!streamingAssistant
@@ -528,6 +530,9 @@ function App() {
     }
     if (!selectedProvider.supports_vision) {
       setAttachments([])
+    }
+    if (!selectedProvider.supports_tool_calling) {
+      setEnableSearch(false)
     }
   }, [selectedProvider])
 
@@ -763,6 +768,10 @@ function App() {
   async function sendMessage() {
     if (!token || !selectedProviderId || chatLoading) return
     const sessionVersion = authSessionVersionRef.current
+    if (enableSearch && !selectedProviderSupportsToolCalling) {
+      setChatError('当前模型不支持原生工具调用，无法开启联网搜索')
+      return
+    }
     if (enableSearch) {
       const unavailableReason = getSearchProviderUnavailableReason(
         searchProvider,
@@ -803,8 +812,9 @@ function App() {
         conversation_id: currentConversationId ?? undefined,
         text: currentInput,
         enable_thinking: selectedProvider?.supports_thinking ? enableThinking : false,
-        enable_search: enableSearch,
-        search_provider: enableSearch ? searchProvider : null,
+        enable_search: selectedProviderSupportsToolCalling ? enableSearch : false,
+        search_provider:
+          selectedProviderSupportsToolCalling && enableSearch ? searchProvider : null,
         effort,
         attachments: currentAttachments,
       }
@@ -1007,18 +1017,19 @@ function App() {
 
   function editProvider(provider: Provider) {
     setEditingProviderId(provider.id)
-    setProviderForm({
-      name: provider.name,
-      api_url: '',
-      api_key: '',
-      model_name: provider.model_name,
-      supports_thinking: provider.supports_thinking,
-      supports_vision: provider.supports_vision,
-      thinking_effort: normalizeThinkingEffort(provider.thinking_effort),
-      max_context_window: provider.max_context_window,
-      max_output_tokens: provider.max_output_tokens,
-      is_enabled: provider.is_enabled,
-    })
+      setProviderForm({
+        name: provider.name,
+        api_url: '',
+        api_key: '',
+        model_name: provider.model_name,
+        supports_thinking: provider.supports_thinking,
+        supports_vision: provider.supports_vision,
+        supports_tool_calling: provider.supports_tool_calling,
+        thinking_effort: normalizeThinkingEffort(provider.thinking_effort),
+        max_context_window: provider.max_context_window,
+        max_output_tokens: provider.max_output_tokens,
+        is_enabled: provider.is_enabled,
+      })
     navigateToAdminSection('providers')
   }
 
@@ -1361,16 +1372,20 @@ function App() {
                           <input type="number" value={providerForm.max_output_tokens} onChange={(event) => setProviderForm((prev) => ({ ...prev, max_output_tokens: Number(event.target.value) }))} />
                         </label>
                       </div>
-                      <div className="inline-grid three">
-                        <label className="checkbox-row">
-                          <input checked={providerForm.supports_thinking} onChange={(event) => setProviderForm((prev) => ({ ...prev, supports_thinking: event.target.checked }))} type="checkbox" />
-                          支持思考
-                        </label>
-                        <label className="checkbox-row">
-                          <input checked={providerForm.supports_vision} onChange={(event) => setProviderForm((prev) => ({ ...prev, supports_vision: event.target.checked }))} type="checkbox" />
-                          支持视觉
-                        </label>
-                      </div>
+                        <div className="inline-grid three">
+                          <label className="checkbox-row">
+                            <input checked={providerForm.supports_thinking} onChange={(event) => setProviderForm((prev) => ({ ...prev, supports_thinking: event.target.checked }))} type="checkbox" />
+                            支持思考
+                          </label>
+                          <label className="checkbox-row">
+                            <input checked={providerForm.supports_vision} onChange={(event) => setProviderForm((prev) => ({ ...prev, supports_vision: event.target.checked }))} type="checkbox" />
+                            支持视觉
+                          </label>
+                          <label className="checkbox-row">
+                            <input checked={providerForm.supports_tool_calling} onChange={(event) => setProviderForm((prev) => ({ ...prev, supports_tool_calling: event.target.checked }))} type="checkbox" />
+                            支持工具调用
+                          </label>
+                        </div>
                       <label className="checkbox-row">
                         <input checked={providerForm.is_enabled} onChange={(event) => setProviderForm((prev) => ({ ...prev, is_enabled: event.target.checked }))} type="checkbox" />
                         启用
@@ -1415,13 +1430,14 @@ function App() {
                             <strong>{provider.name}</strong>
                             <span>{provider.model_name}</span>
                           </div>
-                          <div className="provider-flags">
-                            <span className="meta-chip">Anthropic Messages</span>
-                            {provider.supports_thinking ? <span className="meta-chip">思考</span> : null}
-                            {provider.supports_vision ? <span className="meta-chip">视觉</span> : null}
-                            <span className="meta-chip">输出 {provider.max_output_tokens}</span>
-                            <span className="meta-chip">{provider.is_enabled ? '启用中' : '已禁用'}</span>
-                          </div>
+                            <div className="provider-flags">
+                              <span className="meta-chip">Anthropic Messages</span>
+                              {provider.supports_thinking ? <span className="meta-chip">思考</span> : null}
+                              {provider.supports_vision ? <span className="meta-chip">视觉</span> : null}
+                              {provider.supports_tool_calling ? <span className="meta-chip">工具调用</span> : null}
+                              <span className="meta-chip">输出 {provider.max_output_tokens}</span>
+                              <span className="meta-chip">{provider.is_enabled ? '启用中' : '已禁用'}</span>
+                            </div>
                           <div className="provider-actions">
                             <span className="masked-key">{provider.api_key_masked}</span>
                             <button className="ghost-btn" onClick={() => editProvider(provider)} type="button">编辑</button>
@@ -1747,17 +1763,23 @@ function App() {
                     ))}
                   </select>
                 ) : null}
-                <button
-                  className={enableSearch ? 'tool-btn active' : 'tool-btn'}
-                  onClick={() => {
-                    setChatError('')
-                    setEnableSearch((value) => !value)
-                  }}
-                  type="button"
-                >
-                  <Sparkles size={15} />
-                  联网搜索
-                </button>
+                  <button
+                    className={enableSearch ? 'tool-btn active' : 'tool-btn'}
+                    onClick={() => {
+                      setChatError('')
+                      setEnableSearch((value) => !value)
+                    }}
+                    disabled={!selectedProviderSupportsToolCalling}
+                    title={
+                      selectedProviderSupportsToolCalling
+                        ? '允许模型按需使用联网搜索'
+                        : '当前模型不支持原生工具调用'
+                    }
+                    type="button"
+                  >
+                    <Sparkles size={15} />
+                    联网搜索
+                  </button>
                 <select
                   disabled={!enableSearch}
                   value={searchProvider}

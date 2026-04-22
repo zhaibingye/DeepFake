@@ -6,7 +6,6 @@ import sqlite3
 from contextlib import closing
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote
 
 import httpx
 from fastapi import HTTPException
@@ -38,12 +37,10 @@ class ChatStreamContext:
     provider: sqlite3.Row
     conversation_id: int
     created_new_conversation: bool
-    search_query_text: str
     pending_user_text: str | None
     pending_user_content_json: str | None
     created_at: str
     request_payload: dict[str, Any]
-    search_tool: dict[str, Any] | None
 
 
 def parse_message(row: sqlite3.Row) -> dict[str, Any]:
@@ -143,6 +140,7 @@ def build_chat_request_payload(
     provider: sqlite3.Row,
     history: list[dict[str, Any]],
     payload: Any,
+    selected_tool: dict[str, Any] | None = None,
     stream: bool = False,
 ) -> dict[str, Any]:
     request_payload: dict[str, Any] = {
@@ -155,25 +153,38 @@ def build_chat_request_payload(
         request_payload["output_config"] = {
             "effort": payload.effort or provider["thinking_effort"]
         }
+    if selected_tool:
+        request_payload["tools"] = [selected_tool]
     if stream:
         request_payload["stream"] = True
     return request_payload
 
 
-def resolve_search_tool(payload: Any) -> dict[str, Any] | None:
+def provider_supports_tool_calling(provider: sqlite3.Row) -> bool:
+    return bool(provider["supports_tool_calling"])
+
+
+def selected_search_tool_schema(
+    payload: Any, provider: sqlite3.Row
+) -> dict[str, Any] | None:
     if not getattr(payload, "enable_search", False):
         return None
+    if not provider_supports_tool_calling(provider):
+        raise SearchProviderUnavailableError("当前模型不支持原生工具调用，无法开启联网搜索")
     if payload.search_provider == "exa":
-        return {"name": "exa_search", "label": "Exa 搜索"}
+        from app.tool_runtime import search_tool_schema
+
+        return search_tool_schema("exa")
     if payload.search_provider == "tavily":
         from app.main import get_tavily_config
+        from app.tool_runtime import search_tool_schema
 
         config = get_tavily_config()
         if not config["is_enabled"] or not config["api_key"]:
             raise SearchProviderUnavailableError(
                 "Tavily 搜索当前不可用，请先在后台配置"
             )
-        return {"name": "tavily_search", "label": "Tavily 搜索"}
+        return search_tool_schema("tavily")
     raise HTTPException(status_code=400, detail="请先选择搜索来源")
 
 
@@ -389,32 +400,23 @@ def normalize_search_result(tool_label: str, result: Any) -> dict[str, str]:
 
 
 def run_exa_search(query: str) -> dict[str, str]:
-    normalized_query = normalize_search_query(query)
-    return normalize_search_result(
-        "Exa 搜索",
-        call_remote_mcp_tool(
-            EXA_REMOTE_MCP_URL,
-            "web_search_exa",
-            {"query": normalized_query},
-        ),
-    )
+    from app.tool_runtime import execute_native_search_tool
+
+    return execute_native_search_tool("exa", {"query": query})
 
 
 def run_tavily_search(query: str) -> dict[str, str]:
-    normalized_query = normalize_search_query(query)
     from app.main import get_tavily_config
+    from app.tool_runtime import execute_native_search_tool
 
     config = get_tavily_config()
     api_key = config.get("api_key", "").strip()
-    if not api_key:
+    if not config.get("is_enabled") or not api_key:
         raise RuntimeError("Tavily 搜索当前不可用，请先在后台配置")
-    return normalize_search_result(
-        "Tavily 搜索",
-        call_remote_mcp_tool(
-            f"{TAVILY_REMOTE_MCP_URL}?tavilyApiKey={quote(api_key, safe='')}",
-            "tavily-search",
-            {"query": normalized_query},
-        ),
+    return execute_native_search_tool(
+        "tavily",
+        {"query": query},
+        tavily_api_key=api_key,
     )
 
 
@@ -424,22 +426,6 @@ def execute_search_tool(tool_name: str, query: str) -> dict[str, str]:
     if tool_name == "tavily_search":
         return run_tavily_search(query)
     raise HTTPException(status_code=400, detail="未知搜索工具")
-
-
-def inject_search_result_into_request_payload(
-    request_payload: dict[str, Any], tool_result: dict[str, str]
-) -> None:
-    request_payload["messages"].append(
-        {
-            "role": "user",
-            "content": (
-                f"以下是本轮问题的联网搜索结果，请基于这些结果回答。\n"
-                f"工具: {tool_result['label']}\n"
-                f"摘要: {tool_result['detail']}\n\n"
-                f"联网搜索结果:\n{tool_result['output']}"
-            ),
-        }
-    )
 
 
 def prepare_stream_chat(payload: Any, user: dict[str, Any]) -> ChatStreamContext:
@@ -453,12 +439,12 @@ def prepare_stream_chat(payload: Any, user: dict[str, Any]) -> ChatStreamContext
         raise HTTPException(status_code=400, detail="当前模型不支持思考")
     if payload.attachments and not provider["supports_vision"]:
         raise HTTPException(status_code=400, detail="当前模型不支持图片")
-    search_tool = resolve_search_tool(payload)
+    selected_tool = selected_search_tool_schema(payload, provider)
 
     now = utcnow()
-    search_query_text = payload.text.strip()
-    content = message_to_anthropic_content(search_query_text, payload.attachments)
-    pending_user_text = search_query_text if isinstance(content, str) else None
+    user_text = payload.text.strip()
+    content = message_to_anthropic_content(user_text, payload.attachments)
+    pending_user_text = user_text if isinstance(content, str) else None
     pending_user_content_json = (
         json.dumps(content, ensure_ascii=False) if isinstance(content, list) else None
     )
@@ -491,6 +477,7 @@ def prepare_stream_chat(payload: Any, user: dict[str, Any]) -> ChatStreamContext
         provider,
         history,
         payload,
+        selected_tool=selected_tool,
         stream=True,
     )
 
@@ -498,12 +485,10 @@ def prepare_stream_chat(payload: Any, user: dict[str, Any]) -> ChatStreamContext
         provider=provider,
         conversation_id=conversation_id,
         created_new_conversation=created_new_conversation,
-        search_query_text=search_query_text,
         pending_user_text=pending_user_text,
         pending_user_content_json=pending_user_content_json,
         created_at=now,
         request_payload=request_payload,
-        search_tool=search_tool,
     )
 
 

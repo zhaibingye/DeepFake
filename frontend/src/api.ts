@@ -110,6 +110,7 @@ export const api = {
       model_name: string
       supports_thinking: boolean
       supports_vision: boolean
+      supports_tool_calling: boolean
       thinking_effort: string
       max_context_window: number
       max_output_tokens: number
@@ -126,6 +127,7 @@ export const api = {
       model_name: string
       supports_thinking: boolean
       supports_vision: boolean
+      supports_tool_calling: boolean
       thinking_effort: string
       max_context_window: number
       max_output_tokens: number

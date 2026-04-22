@@ -66,6 +66,56 @@ class SearchProviderTests(unittest.TestCase):
             },
         )
 
+    def test_public_search_provider_status_does_not_imply_tool_support(self) -> None:
+        response = self.client.get("/api/search-providers")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["exa"]["is_enabled"])
+        self.assertNotIn("supports_tool_calling", response.json()["exa"])
+
+    def test_admin_provider_round_trip_persists_tool_support_flag(self) -> None:
+        create_response = self.client.post(
+            "/api/admin/providers",
+            json={
+                "name": "Anthropic Provider",
+                "api_url": "https://api.anthropic.com/v1",
+                "api_key": "test-key",
+                "model_name": "claude-test",
+                "supports_thinking": True,
+                "supports_vision": False,
+                "supports_tool_calling": True,
+                "thinking_effort": "high",
+                "max_context_window": 256000,
+                "max_output_tokens": 32000,
+                "is_enabled": True,
+            },
+        )
+        self.assertEqual(create_response.status_code, 200)
+        self.assertTrue(create_response.json()["supports_tool_calling"])
+
+        provider_id = create_response.json()["id"]
+        update_response = self.client.put(
+            f"/api/admin/providers/{provider_id}",
+            json={
+                "name": "Anthropic Provider",
+                "api_url": "https://api.anthropic.com/v1",
+                "api_key": "test-key",
+                "model_name": "claude-test",
+                "supports_thinking": True,
+                "supports_vision": False,
+                "supports_tool_calling": False,
+                "thinking_effort": "high",
+                "max_context_window": 256000,
+                "max_output_tokens": 32000,
+                "is_enabled": True,
+            },
+        )
+        self.assertEqual(update_response.status_code, 200)
+        self.assertFalse(update_response.json()["supports_tool_calling"])
+
+        list_response = self.client.get("/api/admin/providers")
+        self.assertEqual(list_response.status_code, 200)
+        self.assertFalse(list_response.json()[0]["supports_tool_calling"])
+
     def test_admin_can_configure_tavily(self) -> None:
         response = self.client.put(
             "/api/admin/search-providers/tavily",
