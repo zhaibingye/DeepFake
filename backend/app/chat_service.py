@@ -13,6 +13,12 @@ from fastapi import HTTPException
 
 from app.auth import utcnow
 from app.db import get_conn
+from app.timeline import (
+    answer_text_from_parts,
+    assistant_content_from_row,
+    create_part,
+    message_parts_from_row,
+)
 
 MCP_PROTOCOL_VERSION = "2025-06-18"
 MCP_CLIENT_INFO = {"name": "deepfake-backend", "version": "1.0.0"}
@@ -42,15 +48,19 @@ class ChatStreamContext:
 
 def parse_message(row: sqlite3.Row) -> dict[str, Any]:
     content = row["content_text"]
-    if row["content_json"]:
+    if row["role"] != "assistant" and row["content_json"]:
         content = json.loads(row["content_json"])
-    return {
+    message = {
         "id": row["id"],
         "role": row["role"],
         "content": content,
         "thinking_text": row["thinking_text"] or "",
         "created_at": row["created_at"],
     }
+    if row["role"] == "assistant":
+        message["content"] = assistant_content_from_row(row)
+        message["parts"] = message_parts_from_row(row)
+    return message
 
 
 def fetch_provider(provider_id: int, include_disabled: bool = False) -> sqlite3.Row:
@@ -113,6 +123,18 @@ def build_history(conversation_id: int) -> list[dict[str, Any]]:
         content: Any = row["content_text"]
         if row["content_json"]:
             content = json.loads(row["content_json"])
+        if (
+            row["role"] == "assistant"
+            and isinstance(content, dict)
+            and isinstance(content.get("parts"), list)
+        ):
+            history.append(
+                {
+                    "role": "assistant",
+                    "content": answer_text_from_parts(content["parts"]),
+                }
+            )
+            continue
         history.append({"role": row["role"], "content": content})
     return history
 
@@ -491,6 +513,24 @@ def commit_stream_chat(
     assistant_created_at = utcnow()
     final_assistant_text = assistant_text.strip() or "模型没有返回可显示文本。"
     final_thinking_text = thinking_text.strip()
+    assistant_parts: list[dict[str, Any]] = []
+    if final_thinking_text:
+        assistant_parts.append(
+            create_part(
+                "thinking-1",
+                "thinking",
+                status="done",
+                text=final_thinking_text,
+            )
+        )
+    assistant_parts.append(
+        create_part(
+            "answer-1",
+            "answer",
+            status="done",
+            text=final_assistant_text,
+        )
+    )
     with closing(get_conn()) as conn:
         conn.execute(
             "INSERT INTO messages (conversation_id, role, content_text, content_json, thinking_text, created_at) VALUES (?, 'user', ?, ?, '', ?)",
@@ -502,10 +542,11 @@ def commit_stream_chat(
             ),
         )
         conn.execute(
-            "INSERT INTO messages (conversation_id, role, content_text, content_json, thinking_text, created_at) VALUES (?, 'assistant', ?, NULL, ?, ?)",
+            "INSERT INTO messages (conversation_id, role, content_text, content_json, thinking_text, created_at) VALUES (?, 'assistant', ?, ?, ?, ?)",
             (
                 context.conversation_id,
                 final_assistant_text,
+                json.dumps({"parts": assistant_parts}, ensure_ascii=False),
                 final_thinking_text,
                 assistant_created_at,
             ),

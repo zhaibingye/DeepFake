@@ -100,7 +100,7 @@ class ChatStreamCommitTests(unittest.TestCase):
             conn.commit()
             return int(cursor.lastrowid)
 
-    def create_conversation_with_message(self, provider_id: int) -> int:
+    def create_conversation(self, provider_id: int, title: str = "已有会话") -> int:
         now = utcnow()
         with closing(db.get_conn()) as conn:
             cursor = conn.execute(
@@ -109,18 +109,40 @@ class ChatStreamCommitTests(unittest.TestCase):
                     user_id, provider_id, title, created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?)
                 """,
-                (self.user["id"], provider_id, "已有会话", now, now),
+                (self.user["id"], provider_id, title, now, now),
             )
-            conversation_id = int(cursor.lastrowid)
+            conn.commit()
+            return int(cursor.lastrowid)
+
+    def insert_message(
+        self,
+        conversation_id: int,
+        role: str,
+        content_text: str | None,
+        content_json: str | None,
+        thinking_text: str,
+    ) -> None:
+        with closing(db.get_conn()) as conn:
             conn.execute(
                 """
                 INSERT INTO messages (
                     conversation_id, role, content_text, content_json, thinking_text, created_at
-                ) VALUES (?, 'user', ?, NULL, '', ?)
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (conversation_id, "旧消息", now),
+                (
+                    conversation_id,
+                    role,
+                    content_text,
+                    content_json,
+                    thinking_text,
+                    utcnow(),
+                ),
             )
             conn.commit()
+
+    def create_conversation_with_message(self, provider_id: int) -> int:
+        conversation_id = self.create_conversation(provider_id)
+        self.insert_message(conversation_id, "user", "旧消息", None, "")
         return conversation_id
 
     def parse_stream_events(self, response) -> list[dict[str, object]]:
@@ -185,10 +207,110 @@ class ChatStreamCommitTests(unittest.TestCase):
                 {
                     "role": "assistant",
                     "content_text": "世界",
-                    "content_json": None,
+                    "content_json": json.dumps(
+                        {
+                            "parts": [
+                                {
+                                    "id": "thinking-1",
+                                    "kind": "thinking",
+                                    "status": "done",
+                                    "text": "思考中",
+                                },
+                                {
+                                    "id": "answer-1",
+                                    "kind": "answer",
+                                    "status": "done",
+                                    "text": "世界",
+                                },
+                            ]
+                        },
+                        ensure_ascii=False,
+                    ),
                     "thinking_text": "思考中",
                 },
             ],
+        )
+
+    def test_done_payload_returns_assistant_parts_in_order(self) -> None:
+        provider_id = self.create_provider()
+
+        async def fake_stream_provider_events(provider, payload):
+            yield 'data: {"type":"content_block_start","content_block":{"type":"thinking"}}'
+            yield 'data: {"type":"content_block_delta","delta":{"thinking":"先判断"}}'
+            yield 'data: {"type":"content_block_stop"}'
+            yield 'data: {"type":"content_block_start","content_block":{"type":"text"}}'
+            yield 'data: {"type":"content_block_delta","delta":{"text":"最终回答"}}'
+            yield 'data: {"type":"content_block_stop"}'
+            yield 'data: {"type":"message_stop"}'
+
+        with patch("app.main.stream_provider_events", fake_stream_provider_events):
+            response = self.client.post(
+                "/api/chat/stream",
+                json={"provider_id": provider_id, "text": "你好", "attachments": []},
+            )
+
+        events = self.parse_stream_events(response)
+        self.assertEqual(events[-1]["type"], "done")
+        assistant = events[-1]["messages"][1]
+        self.assertEqual(assistant["role"], "assistant")
+        self.assertIsInstance(assistant["content"], str)
+        self.assertEqual(assistant["content"], "最终回答")
+        self.assertEqual(
+            [part["kind"] for part in assistant["parts"]],
+            ["thinking", "answer"],
+        )
+        self.assertEqual(assistant["parts"][0]["text"], "先判断")
+        self.assertEqual(assistant["parts"][1]["text"], "最终回答")
+
+    def test_legacy_assistant_message_is_mapped_to_timeline_parts(self) -> None:
+        provider_id = self.create_provider()
+        conversation_id = self.create_conversation(provider_id)
+        self.insert_message(conversation_id, "assistant", "旧回答", None, "旧思考")
+
+        response = self.client.get(f"/api/conversations/{conversation_id}/messages")
+
+        self.assertEqual(response.status_code, 200)
+        assistant = response.json()["messages"][0]
+        self.assertIsInstance(assistant["content"], str)
+        self.assertEqual(assistant["content"], "旧回答")
+        self.assertEqual(
+            [part["kind"] for part in assistant["parts"]],
+            ["thinking", "answer"],
+        )
+        self.assertEqual(assistant["parts"][0]["text"], "旧思考")
+        self.assertEqual(assistant["parts"][1]["text"], "旧回答")
+
+    def test_conversation_messages_returns_string_content_for_persisted_assistant_parts(
+        self,
+    ) -> None:
+        provider_id = self.create_provider()
+
+        async def fake_stream_provider_events(provider, payload):
+            yield 'data: {"type":"content_block_delta","delta":{"thinking":"先判断"}}'
+            yield 'data: {"type":"content_block_delta","delta":{"text":"最终回答"}}'
+            yield 'data: {"type":"message_stop"}'
+
+        with patch("app.main.stream_provider_events", fake_stream_provider_events):
+            response = self.client.post(
+                "/api/chat/stream",
+                json={"provider_id": provider_id, "text": "你好", "attachments": []},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        done_event = self.parse_stream_events(response)[-1]
+        conversation_id = done_event["conversation"]["id"]
+
+        messages_response = self.client.get(
+            f"/api/conversations/{conversation_id}/messages"
+        )
+
+        self.assertEqual(messages_response.status_code, 200)
+        assistant = messages_response.json()["messages"][1]
+        self.assertIsInstance(assistant["content"], str)
+        self.assertEqual(assistant["content"], "最终回答")
+        self.assertEqual(
+            [part["kind"] for part in assistant["parts"]],
+            ["thinking", "answer"],
         )
 
     def test_stream_provider_error_does_not_persist_partial_round(self) -> None:
@@ -288,7 +410,25 @@ class ChatStreamCommitTests(unittest.TestCase):
                 {
                     "role": "assistant",
                     "content_text": "正常结束",
-                    "content_json": None,
+                    "content_json": json.dumps(
+                        {
+                            "parts": [
+                                {
+                                    "id": "thinking-1",
+                                    "kind": "thinking",
+                                    "status": "done",
+                                    "text": "先想一下",
+                                },
+                                {
+                                    "id": "answer-1",
+                                    "kind": "answer",
+                                    "status": "done",
+                                    "text": "正常结束",
+                                },
+                            ]
+                        },
+                        ensure_ascii=False,
+                    ),
                     "thinking_text": "先想一下",
                 },
             ],
@@ -322,7 +462,19 @@ class ChatStreamCommitTests(unittest.TestCase):
                 {
                     "role": "assistant",
                     "content_text": "完成事件也提交",
-                    "content_json": None,
+                    "content_json": json.dumps(
+                        {
+                            "parts": [
+                                {
+                                    "id": "answer-1",
+                                    "kind": "answer",
+                                    "status": "done",
+                                    "text": "完成事件也提交",
+                                }
+                            ]
+                        },
+                        ensure_ascii=False,
+                    ),
                     "thinking_text": "",
                 },
             ],

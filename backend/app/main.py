@@ -38,6 +38,7 @@ from app.auth import (
     verify_password,
 )
 from app.db import get_conn
+from app.timeline import assistant_content_from_row, message_parts_from_row
 
 BASE_DIR = db.BASE_DIR
 ANTHROPIC_VERSION = "2023-06-01"
@@ -365,15 +366,19 @@ def fetch_conversation(conversation_id: int, user_id: int) -> sqlite3.Row:
 
 def parse_message(row: sqlite3.Row) -> dict[str, Any]:
     content = row["content_text"]
-    if row["content_json"]:
+    if row["role"] != "assistant" and row["content_json"]:
         content = json.loads(row["content_json"])
-    return {
+    message = {
         "id": row["id"],
         "role": row["role"],
         "content": content,
         "thinking_text": row["thinking_text"] or "",
         "created_at": row["created_at"],
     }
+    if row["role"] == "assistant":
+        message["content"] = assistant_content_from_row(row)
+        message["parts"] = message_parts_from_row(row)
+    return message
 
 
 def guess_media_type(filename: str) -> str:
