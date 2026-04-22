@@ -1,3 +1,5 @@
+export type ThinkingEffort = 'low' | 'medium' | 'high' | 'max'
+
 export type User = {
   id: number
   username: string
@@ -17,13 +19,17 @@ export type AdminSettings = {
   allow_registration: boolean
 }
 
+export type SetupStatus = {
+  needs_admin_setup: boolean
+}
+
 export type Provider = {
   id: number
   name: string
   model_name: string
   supports_thinking: boolean
   supports_vision: boolean
-  thinking_effort: 'low' | 'medium' | 'high' | 'max'
+  thinking_effort: ThinkingEffort
   max_context_window: number
   max_output_tokens: number
   is_enabled: boolean
@@ -36,6 +42,26 @@ export type Attachment = {
   name: string
   media_type: string
   data: string
+}
+
+export type SearchProviderKind = 'exa' | 'tavily'
+
+export type SearchProviderStatus = {
+  is_enabled: boolean
+  is_configured: boolean
+}
+
+export type SearchProviderAvailability = Record<SearchProviderKind, SearchProviderStatus>
+
+export type ChatRequest = {
+  provider_id: number
+  conversation_id?: number
+  text: string
+  enable_thinking: boolean
+  enable_search: boolean
+  search_provider: SearchProviderKind | null
+  effort: string
+  attachments: Attachment[]
 }
 
 export type Message = {
@@ -55,3 +81,27 @@ export type Conversation = {
   created_at: string
   updated_at: string
 }
+
+export type StreamActivity = {
+  id: string
+  kind: 'thinking' | 'tool'
+  label: string
+  status: 'running' | 'done' | 'error'
+  duration_ms?: number
+  detail?: string
+  output?: string
+}
+
+export type ChatDonePayload = {
+  conversation: Conversation
+  messages: Message[]
+}
+
+export type ChatStreamEvent =
+  | { type: 'conversation'; conversation: Partial<Conversation> & Pick<Conversation, 'id' | 'provider_id'> }
+  | { type: 'text_delta'; delta: string }
+  | { type: 'thinking_delta'; delta: string }
+  | { type: 'activity'; activity: StreamActivity }
+  | ({ type: 'done' } & ChatDonePayload)
+  | { type: 'error'; detail: string }
+  | { type: 'usage'; usage: Record<string, unknown> }

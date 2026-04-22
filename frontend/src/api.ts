@@ -1,4 +1,15 @@
-import type { AdminManagedUser, AdminSettings, Attachment, Conversation, Message, Provider, User } from './types'
+import type {
+  AdminManagedUser,
+  AdminSettings,
+  ChatRequest,
+  ChatStreamEvent,
+  Conversation,
+  Message,
+  Provider,
+  SearchProviderAvailability,
+  SetupStatus,
+  User,
+} from './types'
 
 const API_BASE = 'http://127.0.0.1:8000/api'
 
@@ -68,6 +79,12 @@ async function parseNdjsonStream<T>(response: Response, onChunk: (chunk: T) => v
 
 export const api = {
   health: () => request<{ status: string }>('/health'),
+  setupStatus: () => request<SetupStatus>('/setup/status'),
+  setupAdmin: (username: string, password: string) =>
+    request<{ token: string; user: User }>('/setup/admin', {
+      method: 'POST',
+      body: { username, password },
+    }),
   login: (username: string, password: string) =>
     request<{ token: string; user: User }>('/auth/login', {
       method: 'POST',
@@ -82,6 +99,7 @@ export const api = {
   me: (token: string) => request<User>('/auth/me', { token }),
   logout: (token: string) => request<{ status: string }>('/auth/logout', { method: 'POST', token }),
   listProviders: (token: string) => request<Provider[]>('/providers', { token }),
+  listSearchProviders: () => request<SearchProviderAvailability>('/search-providers'),
   listAdminProviders: (token: string) => request<Provider[]>('/admin/providers', { token }),
   createProvider: (
     token: string,
@@ -141,33 +159,11 @@ export const api = {
     request<{ status: string }>(`/conversations/${conversationId}`, { method: 'DELETE', token }),
   getConversationMessages: (token: string, conversationId: number) =>
     request<{ conversation: Conversation; messages: Message[] }>(`/conversations/${conversationId}/messages`, { token }),
-  sendMessage: (
-    token: string,
-    body: {
-      provider_id: number
-      conversation_id?: number
-      text: string
-      enable_thinking: boolean
-      effort: string
-      attachments: Attachment[]
-    },
-  ) =>
-    request<{ conversation: Conversation; messages: Message[] }>('/chat', {
-      method: 'POST',
-      token,
-      body,
-    }),
   streamMessage: async (
     token: string,
-    body: {
-      provider_id: number
-      conversation_id?: number
-      text: string
-      enable_thinking: boolean
-      effort: string
-      attachments: Attachment[]
-    },
-    onChunk: (chunk: Record<string, unknown>) => void,
+    body: ChatRequest,
+    onChunk: (chunk: ChatStreamEvent) => void,
+    signal?: AbortSignal,
   ) => {
     const response = await fetch(`${API_BASE}/chat/stream`, {
       method: 'POST',
@@ -176,6 +172,7 @@ export const api = {
         Authorization: `Bearer ${token}`,
       },
       body: JSON.stringify(body),
+      signal,
     })
 
     if (!response.ok) {
@@ -189,6 +186,6 @@ export const api = {
       throw new Error(detail)
     }
 
-    await parseNdjsonStream<Record<string, unknown>>(response, onChunk)
+    await parseNdjsonStream<ChatStreamEvent>(response, onChunk)
   },
 }

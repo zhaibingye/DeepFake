@@ -3,9 +3,11 @@ import type { Dispatch, SetStateAction } from 'react'
 import {
   Bot,
   BrainCircuit,
+  ChevronRight,
   Eye,
   FileImage,
   LayoutDashboard,
+  LoaderCircle,
   LogOut,
   MessageSquarePlus,
   PanelLeftClose,
@@ -14,18 +16,39 @@ import {
   SendHorizonal,
   Settings,
   Shield,
+  Square,
   Sparkles,
   Trash2,
   UserRound,
+  Wrench,
 } from 'lucide-react'
 import { api } from './api'
 import { MarkdownView } from './components/MarkdownView'
 import './App.css'
-import type { AdminManagedUser, AdminSettings, Attachment, Conversation, Message, Provider, User } from './types'
+import type {
+  AdminManagedUser,
+  AdminSettings,
+  Attachment,
+  ChatRequest,
+  ChatDonePayload,
+  ChatStreamEvent,
+  Conversation,
+  Message,
+  Provider,
+  SearchProviderAvailability,
+  SearchProviderKind,
+  SearchProviderStatus,
+  SetupStatus,
+  StreamActivity,
+  ThinkingEffort,
+  User,
+} from './types'
 import { fileToAttachment, formatDateTime, messageImages, messagePlainText } from './utils'
 
 type AuthMode = 'login' | 'register'
 type AppRoute = 'chat' | 'admin'
+type AdminSection = 'overview' | 'providers' | 'users'
+type SearchProviderLoadState = 'loading' | 'ready' | 'error'
 type DialogState = {
   mode: 'confirm' | 'prompt'
   title: string
@@ -36,6 +59,10 @@ type DialogState = {
   resolve: (value: boolean | string | null) => void
 }
 
+type ChatMessage = Message & {
+  activities?: StreamActivity[]
+}
+
 const defaultProviderForm = {
   name: '',
   api_url: '',
@@ -43,10 +70,225 @@ const defaultProviderForm = {
   model_name: '',
   supports_thinking: true,
   supports_vision: false,
-  thinking_effort: 'high',
+  thinking_effort: 'high' as ThinkingEffort,
   max_context_window: 256000,
   max_output_tokens: 32000,
   is_enabled: true,
+}
+
+const thinkingEffortOptions: ThinkingEffort[] = ['low', 'medium', 'high', 'max']
+const searchProviderOptions: SearchProviderKind[] = ['exa', 'tavily']
+
+function upsertStreamActivity(list: StreamActivity[], next: StreamActivity) {
+  const index = list.findIndex((item) => item.id === next.id)
+  if (index === -1) return [...list, next]
+  return list.map((item, itemIndex) => (itemIndex === index ? { ...item, ...next } : item))
+}
+
+function formatActivityDuration(durationMs?: number) {
+  if (!durationMs || durationMs < 0) return ''
+  return `${(durationMs / 1000).toFixed(1)}s`
+}
+
+function sumThinkingDuration(activities?: StreamActivity[]) {
+  return (activities ?? [])
+    .filter((activity) => activity.kind === 'thinking' && activity.status !== 'running')
+    .reduce((total, activity) => total + (activity.duration_ms ?? 0), 0)
+}
+
+function toolActivities(activities?: StreamActivity[]) {
+  return (activities ?? []).filter((activity) => activity.kind === 'tool')
+}
+
+function defaultExpandedActivities(activities: StreamActivity[]) {
+  return Object.fromEntries(activities.map((activity) => [activity.id, activity.status === 'error'])) as Record<string, boolean>
+}
+
+function activityStatusIndex(activities: StreamActivity[]) {
+  return Object.fromEntries(activities.map((activity) => [activity.id, activity.status])) as Record<string, StreamActivity['status']>
+}
+
+function formatThinkingLabel(durationMs?: number, isStreaming = false) {
+  if (durationMs && durationMs > 0) {
+    return `已思考（用时 ${Math.max(1, Math.round(durationMs / 1000))} 秒）`
+  }
+  return isStreaming ? '正在思考' : '已思考'
+}
+
+function attachActivitiesToAssistantMessage(messages: Message[], activities: StreamActivity[]): ChatMessage[] {
+  if (!activities.length) return messages as ChatMessage[]
+  let attached = false
+  return messages.map((message) => {
+    if (attached || message.role !== 'assistant') {
+      return message as ChatMessage
+    }
+    attached = true
+    return {
+      ...message,
+      activities,
+    }
+  })
+}
+
+function ActivityList({ activities }: { activities: StreamActivity[] }) {
+  const [expandedById, setExpandedById] = useState<Record<string, boolean>>(() => defaultExpandedActivities(activities))
+  const previousStatusesRef = useRef<Record<string, StreamActivity['status']>>(activityStatusIndex(activities))
+
+  useEffect(() => {
+    const nextStatuses = activityStatusIndex(activities)
+    setExpandedById((prev) => {
+      let changed = Object.keys(prev).length !== activities.length
+      const next = defaultExpandedActivities(activities)
+      for (const activity of activities) {
+        const previousExpanded = prev[activity.id]
+        const previousStatus = previousStatusesRef.current[activity.id]
+        if (previousExpanded !== undefined) {
+          next[activity.id] = previousExpanded
+        }
+        if (previousStatus !== 'error' && activity.status === 'error') {
+          next[activity.id] = true
+        }
+        if (!changed && next[activity.id] !== prev[activity.id]) {
+          changed = true
+        }
+      }
+      previousStatusesRef.current = nextStatuses
+      return changed ? next : prev
+    })
+  }, [activities])
+
+  if (!activities.length) return null
+  return (
+    <div className="stream-activity-list compact">
+      {activities.map((activity) => {
+        const duration = activity.status !== 'running' ? formatActivityDuration(activity.duration_ms) : ''
+        const expandable = Boolean(activity.output && activity.status !== 'running')
+        const cardHeader = (
+          <>
+            <div className="stream-activity-main">
+              <span className={activity.kind === 'tool' ? 'stream-activity-icon tool' : 'stream-activity-icon'}>
+                {activity.kind === 'tool' ? <Wrench size={14} /> : <BrainCircuit size={14} />}
+              </span>
+              <div className="stream-activity-copy">
+                <strong className="stream-activity-title">
+                  <span>{activity.label}</span>
+                  {duration ? <em>({duration})</em> : null}
+                </strong>
+                {activity.detail ? <small>{activity.detail}</small> : null}
+              </div>
+            </div>
+            <div className="stream-activity-meta">
+              {activity.status === 'running' ? <LoaderCircle className="stream-activity-spinner" size={14} /> : null}
+              {expandable ? <span className="stream-activity-expand-label">展开</span> : null}
+              <ChevronRight className={expandable ? 'stream-activity-chevron' : 'stream-activity-chevron muted'} size={14} />
+            </div>
+          </>
+        )
+        if (!expandable) {
+          return (
+            <div className={activity.status === 'error' ? 'stream-activity-card error static' : 'stream-activity-card static'} key={activity.id}>
+              <div className="stream-activity-summary">{cardHeader}</div>
+            </div>
+          )
+        }
+        return (
+          <details
+            className={activity.status === 'error' ? 'stream-activity-card error' : 'stream-activity-card'}
+            key={activity.id}
+            onToggle={(event) => {
+              const nextOpen = (event.currentTarget as HTMLDetailsElement).open
+              setExpandedById((prev) => {
+                if (prev[activity.id] === nextOpen) return prev
+                return {
+                  ...prev,
+                  [activity.id]: nextOpen,
+                }
+              })
+            }}
+            open={Boolean(expandedById[activity.id])}
+          >
+            <summary className="stream-activity-summary">
+              {cardHeader}
+            </summary>
+            <div className="stream-activity-output">
+              <div className="stream-activity-output-shell">
+                <div className="markdown-body compact">
+                  <MarkdownView content={activity.output || ''} enableMath={false} />
+                </div>
+              </div>
+            </div>
+          </details>
+        )
+      })}
+    </div>
+  )
+}
+
+function ThinkingPanel({
+  content,
+  label,
+  open,
+  onToggle,
+}: {
+  content: string
+  label: string
+  open?: boolean
+  onToggle?: (nextOpen: boolean) => void
+}) {
+  const [internalOpen, setInternalOpen] = useState(false)
+  const expanded = open ?? internalOpen
+
+  function handleToggle() {
+    const nextOpen = !expanded
+    if (open === undefined) {
+      setInternalOpen(nextOpen)
+    }
+    onToggle?.(nextOpen)
+  }
+
+  return (
+    <div className={expanded ? 'thinking-box deepseek open' : 'thinking-box deepseek'}>
+      <button className="thinking-summary" onClick={handleToggle} type="button">
+        <span className="thinking-summary-main"><BrainCircuit size={14} /> {label}</span>
+        <ChevronRight className="thinking-summary-chevron" size={14} />
+      </button>
+      {expanded ? (
+        <div className="thinking-box-body">
+          <div className="thinking-box-content">
+            <MarkdownView content={content} enableMath={false} />
+          </div>
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+function normalizeThinkingEffort(effort: string): ThinkingEffort {
+  if (thinkingEffortOptions.includes(effort as ThinkingEffort)) return effort as ThinkingEffort
+  return 'high'
+}
+
+function searchProviderLabel(kind: SearchProviderKind) {
+  return kind === 'exa' ? 'Exa' : 'Tavily'
+}
+
+function isSearchProviderAvailable(status?: SearchProviderStatus | null) {
+  return Boolean(status?.is_enabled && status?.is_configured)
+}
+
+function getSearchProviderUnavailableReason(
+  kind: SearchProviderKind,
+  status?: SearchProviderStatus | null,
+  loadState: SearchProviderLoadState = 'ready',
+) {
+  if (loadState === 'loading') return '搜索源状态加载中，请稍后重试'
+  if (loadState === 'error') return '搜索源状态获取失败，请稍后重试'
+  if (!status) return '搜索源状态获取失败，请稍后重试'
+  if (status.is_enabled && status.is_configured) return ''
+  if (kind === 'tavily' && !status.is_configured) {
+    return 'Tavily 搜索当前不可用，请先在后台配置'
+  }
+  return `${searchProviderLabel(kind)} 搜索当前不可用`
 }
 
 function DeepfakeWhaleIcon({ className }: { className?: string }) {
@@ -64,8 +306,21 @@ function getRouteFromLocation(): AppRoute {
   return window.location.pathname.startsWith('/admin') ? 'admin' : 'chat'
 }
 
+function getAdminSectionFromLocation(): AdminSection {
+  if (window.location.pathname.startsWith('/admin/providers')) return 'providers'
+  if (window.location.pathname.startsWith('/admin/users')) return 'users'
+  return 'overview'
+}
+
+function getAdminPath(section: AdminSection): string {
+  if (section === 'providers') return '/admin/providers'
+  if (section === 'users') return '/admin/users'
+  return '/admin'
+}
+
 function App() {
   const [route, setRoute] = useState<AppRoute>(() => getRouteFromLocation())
+  const [adminSection, setAdminSection] = useState<AdminSection>(() => getAdminSectionFromLocation())
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem('sidebar-collapsed') === '1')
   const [token, setToken] = useState<string | null>(() => localStorage.getItem('token'))
   const [user, setUser] = useState<User | null>(null)
@@ -75,6 +330,8 @@ function App() {
   const [authError, setAuthError] = useState('')
   const [loadingAuth, setLoadingAuth] = useState(false)
   const [publicAuthSettings, setPublicAuthSettings] = useState<AdminSettings>({ allow_registration: true })
+  const [setupStatus, setSetupStatus] = useState<SetupStatus>({ needs_admin_setup: false })
+  const [setupStatusLoaded, setSetupStatusLoaded] = useState(false)
 
   const [providers, setProviders] = useState<Provider[]>([])
   const [adminProviders, setAdminProviders] = useState<Provider[]>([])
@@ -83,15 +340,20 @@ function App() {
   const [conversations, setConversations] = useState<Conversation[]>([])
   const [activeConversationId, setActiveConversationId] = useState<number | null>(null)
   const [activeConversation, setActiveConversation] = useState<Conversation | null>(null)
-  const [messages, setMessages] = useState<Message[]>([])
+  const [messages, setMessages] = useState<ChatMessage[]>([])
   const [selectedProviderId, setSelectedProviderId] = useState<number | null>(null)
   const [input, setInput] = useState('')
   const [attachments, setAttachments] = useState<Attachment[]>([])
   const [enableThinking, setEnableThinking] = useState(true)
-  const [effort, setEffort] = useState<'low' | 'medium' | 'high' | 'max'>('high')
+  const [enableSearch, setEnableSearch] = useState(false)
+  const [searchProvider, setSearchProvider] = useState<SearchProviderKind>('exa')
+  const [searchProviders, setSearchProviders] = useState<SearchProviderAvailability | null>(null)
+  const [searchProviderLoadState, setSearchProviderLoadState] = useState<SearchProviderLoadState>('loading')
+  const [effort, setEffort] = useState<ThinkingEffort>('high')
   const [chatError, setChatError] = useState('')
   const [chatLoading, setChatLoading] = useState(false)
-  const [streamingAssistant, setStreamingAssistant] = useState<{ text: string; thinking: string } | null>(null)
+  const [streamingAssistant, setStreamingAssistant] = useState<{ text: string; thinking: string; activities: StreamActivity[] } | null>(null)
+  const [streamThinkingExpanded, setStreamThinkingExpanded] = useState(true)
   const [pendingUserMessage, setPendingUserMessage] = useState<{ text: string; attachments: Attachment[]; createdAt: string } | null>(null)
   const [providerForm, setProviderForm] = useState(defaultProviderForm)
   const [providerSuccess, setProviderSuccess] = useState('')
@@ -107,14 +369,20 @@ function App() {
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const messageEndRef = useRef<HTMLDivElement | null>(null)
   const shouldFollowStreamRef = useRef(true)
+  const streamAbortRef = useRef<AbortController | null>(null)
+  const streamThinkingExpandedRef = useRef(true)
+  const streamThinkingManuallyExpandedRef = useRef(false)
+  const authSessionVersionRef = useRef(0)
 
   const selectedProvider = providers.find((provider) => provider.id === selectedProviderId) ?? null
   const currentConversation =
     activeConversation ?? conversations.find((conversation) => conversation.id === activeConversationId) ?? null
   const currentConversationProvider =
     providers.find((provider) => provider.id === currentConversation?.provider_id) ?? null
+  const selectedSearchProviderStatus = searchProviders?.[searchProvider] ?? null
   const isAdminRoute = route === 'admin'
   const hasVisibleConversation = messages.length > 0 || !!pendingUserMessage || !!streamingAssistant
+  const providerApiUrlPlaceholder = 'https://.../anthropic/v1'
   const filteredAdminUsers = adminUsers.filter((managedUser) => {
     const keyword = userSearch.trim().toLowerCase()
     if (!keyword) return true
@@ -130,12 +398,25 @@ function App() {
   }
 
   function navigateTo(nextRoute: AppRoute, replace = false) {
-    const nextPath = nextRoute === 'admin' ? '/admin' : '/'
+    const nextPath = nextRoute === 'admin' ? getAdminPath('overview') : '/'
     if (window.location.pathname !== nextPath) {
       const method = replace ? 'replaceState' : 'pushState'
       window.history[method](null, '', nextPath)
     }
     setRoute(nextRoute)
+    if (nextRoute === 'admin') {
+      setAdminSection('overview')
+    }
+  }
+
+  function navigateToAdminSection(nextSection: AdminSection, replace = false) {
+    const nextPath = getAdminPath(nextSection)
+    if (window.location.pathname !== nextPath) {
+      const method = replace ? 'replaceState' : 'pushState'
+      window.history[method](null, '', nextPath)
+    }
+    setRoute('admin')
+    setAdminSection(nextSection)
   }
 
   function closeDialog(result: boolean | string | null) {
@@ -143,6 +424,42 @@ function App() {
       current?.resolve(result)
       return null
     })
+  }
+
+  function stopStreaming() {
+    streamAbortRef.current?.abort()
+    streamAbortRef.current = null
+  }
+
+  function setStreamThinkingPanelExpanded(nextExpanded: boolean) {
+    streamThinkingExpandedRef.current = nextExpanded
+    setStreamThinkingExpanded(nextExpanded)
+  }
+
+  function resetStreamThinkingPanel() {
+    streamThinkingManuallyExpandedRef.current = false
+    setStreamThinkingPanelExpanded(true)
+  }
+
+  function collapseStreamThinkingPanel() {
+    if (streamThinkingManuallyExpandedRef.current || !streamThinkingExpandedRef.current) {
+      return
+    }
+    setStreamThinkingPanelExpanded(false)
+  }
+
+  function handleStreamThinkingToggle(nextOpen: boolean) {
+    setStreamThinkingPanelExpanded(nextOpen)
+    if (nextOpen) {
+      streamThinkingManuallyExpandedRef.current = true
+    }
+  }
+
+  function resetSearchState() {
+    setEnableSearch(false)
+    setSearchProvider('exa')
+    setSearchProviders(null)
+    setSearchProviderLoadState('loading')
   }
 
   function openConfirmDialog(title: string, message: string, confirmLabel = '确认', cancelLabel = '取消') {
@@ -193,20 +510,19 @@ function App() {
   }, [])
 
   useEffect(() => {
-    const handlePopState = () => setRoute(getRouteFromLocation())
+    const handlePopState = () => {
+      setRoute(getRouteFromLocation())
+      setAdminSection(getAdminSectionFromLocation())
+    }
     window.addEventListener('popstate', handlePopState)
     return () => window.removeEventListener('popstate', handlePopState)
-  }, [])
-
-  useEffect(() => {
-    void api.authSettings().then(setPublicAuthSettings).catch(() => undefined)
   }, [])
 
   useEffect(() => {
     if (!selectedProvider) {
       return
     }
-    setEffort(selectedProvider.thinking_effort)
+    setEffort(normalizeThinkingEffort(selectedProvider.thinking_effort))
     if (!selectedProvider.supports_thinking) {
       setEnableThinking(false)
     }
@@ -234,6 +550,19 @@ function App() {
     setSelectedProviderId((prev) => (prev && list.some((provider) => provider.id === prev) ? prev : list[0]?.id ?? null))
   }, [token])
 
+  const loadSearchProviders = useCallback(async () => {
+    setSearchProviderLoadState('loading')
+    try {
+      const nextSearchProviders = await api.listSearchProviders()
+      setSearchProviders(nextSearchProviders)
+      setSearchProviderLoadState('ready')
+    } catch (error) {
+      setSearchProviders(null)
+      setSearchProviderLoadState('error')
+      throw error
+    }
+  }, [])
+
   const loadConversations = useCallback(async (currentToken = token) => {
     if (!currentToken) return
     const list = await api.listConversations(currentToken)
@@ -243,6 +572,19 @@ function App() {
       return list.find((item) => item.id === prev.id) ?? prev
     })
   }, [token])
+
+  const loadConversationsForSession = useCallback(async (currentToken: string, sessionVersion: number) => {
+    const list = await api.listConversations(currentToken)
+    if (sessionVersion !== authSessionVersionRef.current) {
+      return false
+    }
+    setConversations(list)
+    setActiveConversation((prev) => {
+      if (!prev) return prev
+      return list.find((item) => item.id === prev.id) ?? prev
+    })
+    return true
+  }, [])
 
   const loadAdminData = useCallback(async (currentToken = token, role = user?.role) => {
     if (!currentToken || role !== 'admin') return
@@ -256,9 +598,23 @@ function App() {
     setAdminSettings(settings)
   }, [token, user?.role])
 
+  const refreshAuthSurface = useCallback(async () => {
+    try {
+      const [settings, nextSetupStatus] = await Promise.all([
+        api.authSettings(),
+        api.setupStatus(),
+      ])
+      setPublicAuthSettings(settings)
+      setSetupStatus(nextSetupStatus)
+    } finally {
+      setSetupStatusLoaded(true)
+    }
+  }, [])
+
   const bootstrap = useCallback(async (currentToken: string) => {
     try {
       const me = await api.me(currentToken)
+      setSetupStatus({ needs_admin_setup: false })
       setUser(me)
       if (me.role === 'admin') {
         setAdminProfile((prev) => ({ ...prev, username: me.username }))
@@ -292,9 +648,19 @@ function App() {
       setSelectedProviderId(null)
       setAttachments([])
       setInput('')
+      resetSearchState()
       setPendingUserMessage(null)
+      void refreshAuthSurface()
     }
-  }, [loadAdminData, loadConversations, loadProviders, route])
+  }, [loadAdminData, loadConversations, loadProviders, refreshAuthSurface, route])
+
+  useEffect(() => {
+    void refreshAuthSurface()
+  }, [refreshAuthSurface])
+
+  useEffect(() => {
+    void loadSearchProviders().catch(() => undefined)
+  }, [loadSearchProviders, token])
 
   useEffect(() => {
     if (!token) {
@@ -309,24 +675,29 @@ function App() {
     setAuthError('')
     try {
       const result =
-        authMode === 'login'
+        setupStatus.needs_admin_setup
+          ? await api.setupAdmin(authUsername, authPassword)
+          : authMode === 'login'
           ? await api.login(authUsername, authPassword)
           : await api.register(authUsername, authPassword)
       localStorage.setItem('token', result.token)
       setToken(result.token)
       setUser(result.user)
+      setSetupStatus({ needs_admin_setup: false })
       setAuthPassword('')
       navigateTo('chat', true)
     } catch (error) {
       const message = error instanceof Error ? error.message : '认证失败'
       setAuthError(message === '账号已停用' ? '账号已被管理员停用，请联系管理员处理。' : message)
-      void api.authSettings().then(setPublicAuthSettings).catch(() => undefined)
+      void refreshAuthSurface().catch(() => undefined)
     } finally {
       setLoadingAuth(false)
     }
   }
 
   function handleLogout(callApi = true) {
+    authSessionVersionRef.current += 1
+    stopStreaming()
     const currentToken = token
     if (callApi && currentToken) {
       void api.logout(currentToken).catch(() => undefined)
@@ -344,12 +715,16 @@ function App() {
     setActiveConversationId(null)
     setSelectedProviderId(null)
     setAttachments([])
+    setChatLoading(false)
+    setStreamingAssistant(null)
     setInput('')
+    resetSearchState()
     setPendingUserMessage(null)
+    void refreshAuthSurface().catch(() => undefined)
   }
 
   async function openConversation(conversationId: number) {
-    if (!token) return
+    if (!token || chatLoading) return
     const result = await api.getConversationMessages(token, conversationId)
     shouldFollowStreamRef.current = true
     const summary = conversations.find((item) => item.id === conversationId)
@@ -364,6 +739,7 @@ function App() {
   }
 
   function startNewConversation() {
+    if (chatLoading) return
     shouldFollowStreamRef.current = true
     setActiveConversationId(null)
     setActiveConversation(null)
@@ -386,13 +762,30 @@ function App() {
 
   async function sendMessage() {
     if (!token || !selectedProviderId || chatLoading) return
+    const sessionVersion = authSessionVersionRef.current
+    if (enableSearch) {
+      const unavailableReason = getSearchProviderUnavailableReason(
+        searchProvider,
+        selectedSearchProviderStatus,
+        searchProviderLoadState,
+      )
+      if (unavailableReason) {
+        setChatError(unavailableReason)
+        return
+      }
+    }
     const currentInput = input
     const currentAttachments = attachments
     const currentConversationId = activeConversationId
+    const previousConversation = activeConversation
+    const previousMessages = messages
     const currentTitle = currentConversation?.title
     const currentCreatedAt = currentConversation?.created_at
+    let streamedActivities: StreamActivity[] = []
+    let streamedConversationId: number | null = null
     setChatError('')
     setChatLoading(true)
+    resetStreamThinkingPanel()
     setStreamingAssistant(null)
     setInput('')
     setAttachments([])
@@ -403,21 +796,28 @@ function App() {
     })
     shouldFollowStreamRef.current = true
     try {
-      const body = {
+      const abortController = new AbortController()
+      streamAbortRef.current = abortController
+      const body: ChatRequest = {
         provider_id: selectedProviderId,
         conversation_id: currentConversationId ?? undefined,
         text: currentInput,
         enable_thinking: selectedProvider?.supports_thinking ? enableThinking : false,
+        enable_search: enableSearch,
+        search_provider: enableSearch ? searchProvider : null,
         effort,
         attachments: currentAttachments,
       }
 
-      let finalPayload: { conversation: Conversation; messages: Message[] } | undefined
-      await api.streamMessage(token, body, (chunk) => {
-        const type = String(chunk.type ?? '')
-        if (type === 'conversation') {
-          const conversation = chunk.conversation as Partial<Conversation>
+      let finalPayload: ChatDonePayload | undefined
+      await api.streamMessage(token, body, (chunk: ChatStreamEvent) => {
+        if (sessionVersion !== authSessionVersionRef.current) {
+          return
+        }
+        if (chunk.type === 'conversation') {
+          const conversation = chunk.conversation
           if (conversation?.id) {
+            streamedConversationId = Number(conversation.id)
             setActiveConversationId(Number(conversation.id))
             setActiveConversation({
               id: Number(conversation.id),
@@ -431,43 +831,113 @@ function App() {
           }
           return
         }
-        if (type === 'text_delta') {
-          setStreamingAssistant((prev) => ({ text: `${prev?.text ?? ''}${String(chunk.delta ?? '')}`, thinking: prev?.thinking ?? '' }))
+        if (chunk.type === 'text_delta') {
+          const delta = chunk.delta
+          if (delta) {
+            collapseStreamThinkingPanel()
+          }
+          setStreamingAssistant((prev) => ({
+            text: `${prev?.text ?? ''}${delta}`,
+            thinking: prev?.thinking ?? '',
+            activities: prev?.activities ?? [],
+          }))
           return
         }
-        if (type === 'thinking_delta') {
-          setStreamingAssistant((prev) => ({ text: prev?.text ?? '', thinking: `${prev?.thinking ?? ''}${String(chunk.delta ?? '')}` }))
+        if (chunk.type === 'thinking_delta') {
+          const delta = chunk.delta
+          setStreamingAssistant((prev) => ({
+            text: prev?.text ?? '',
+            thinking: `${prev?.thinking ?? ''}${delta}`,
+            activities: prev?.activities ?? [],
+          }))
           return
         }
-        if (type === 'done') {
-          finalPayload = {
-            conversation: chunk.conversation as Conversation,
-            messages: chunk.messages as Message[],
+        if (chunk.type === 'activity') {
+          const activity = chunk.activity
+          if (activity?.id) {
+            streamedActivities = upsertStreamActivity(streamedActivities, activity)
+            setStreamingAssistant((prev) => ({
+              text: prev?.text ?? '',
+              thinking: prev?.thinking ?? '',
+              activities: upsertStreamActivity(prev?.activities ?? [], activity),
+            }))
           }
           return
         }
-        if (type === 'error') {
-          throw new Error(String(chunk.detail ?? '流式调用失败'))
+        if (chunk.type === 'done') {
+          finalPayload = {
+            conversation: chunk.conversation,
+            messages: chunk.messages,
+          }
+          return
         }
-      })
+        if (chunk.type === 'error') {
+          throw new Error(chunk.detail || '流式调用失败')
+        }
+      }, abortController.signal)
 
       const donePayload = finalPayload
+      if (sessionVersion !== authSessionVersionRef.current) {
+        return
+      }
       if (!donePayload) {
         throw new Error('流式响应未正确完成')
       }
 
       setActiveConversationId(donePayload.conversation.id)
       setActiveConversation(donePayload.conversation)
-      setMessages((prev) => (currentConversationId ? [...prev, ...donePayload.messages] : donePayload.messages))
+      const completedMessages = attachActivitiesToAssistantMessage(donePayload.messages, streamedActivities)
+      setMessages((prev) => (currentConversationId ? [...prev, ...completedMessages] : completedMessages))
       setPendingUserMessage(null)
       setStreamingAssistant(null)
-      await loadConversations(token)
+      await loadConversationsForSession(token, sessionVersion)
     } catch (error) {
+      if (sessionVersion !== authSessionVersionRef.current) {
+        return
+      }
+      setActiveConversationId(currentConversationId)
+      setActiveConversation(previousConversation)
+      setMessages(previousMessages)
       setPendingUserMessage(null)
       setStreamingAssistant(null)
+      const aborted =
+        error instanceof DOMException
+          ? error.name === 'AbortError'
+          : error instanceof Error && error.name === 'AbortError'
+      const conversationToSync = streamedConversationId ?? currentConversationId
+      if (conversationToSync) {
+        try {
+          const result = await api.getConversationMessages(token, conversationToSync)
+          if (sessionVersion !== authSessionVersionRef.current) {
+            return
+          }
+          setActiveConversationId(result.conversation.id)
+          setActiveConversation(result.conversation)
+          setMessages(result.messages)
+        } catch {
+          setActiveConversationId(currentConversationId)
+          setActiveConversation(previousConversation)
+          setMessages(previousMessages)
+        }
+      } else {
+        setActiveConversationId(null)
+        setActiveConversation(null)
+        setMessages([])
+      }
+      await loadConversationsForSession(token, sessionVersion).catch(() => undefined)
+      if (sessionVersion !== authSessionVersionRef.current) {
+        return
+      }
+      if (aborted) {
+        setChatError('')
+        return
+      }
       setChatError(error instanceof Error ? error.message : '发送失败')
     } finally {
-      setChatLoading(false)
+      if (sessionVersion === authSessionVersionRef.current) {
+        streamAbortRef.current = null
+        setChatLoading(false)
+      }
     }
   }
 
@@ -544,12 +1014,12 @@ function App() {
       model_name: provider.model_name,
       supports_thinking: provider.supports_thinking,
       supports_vision: provider.supports_vision,
-      thinking_effort: provider.thinking_effort,
+      thinking_effort: normalizeThinkingEffort(provider.thinking_effort),
       max_context_window: provider.max_context_window,
       max_output_tokens: provider.max_output_tokens,
       is_enabled: provider.is_enabled,
     })
-    navigateTo('admin')
+    navigateToAdminSection('providers')
   }
 
   async function submitAdminProfile(event: React.FormEvent<HTMLFormElement>) {
@@ -673,38 +1143,54 @@ function App() {
     }
   }
 
+  const enabledUsersCount = adminUsers.filter((managedUser) => managedUser.is_enabled).length
+  const enabledProvidersCount = adminProviders.filter((provider) => provider.is_enabled).length
+
   if (!token || !user) {
     return (
       <>
         <div className="auth-shell">
           <div className="auth-card">
-          <div className="auth-brand">
-            <div className="brand-mark"><Sparkles size={18} /></div>
-            <div>
-              <h1>deepfake</h1>
-              <p>极简聊天界面，多用户与后台配置分离。</p>
+            <div className="auth-brand">
+              <div className="brand-mark"><Sparkles size={18} /></div>
+              <div>
+                <h1>deepfake</h1>
+                <p>极简聊天界面，多用户与后台配置分离。</p>
+              </div>
             </div>
-          </div>
-          <div className="auth-tabs">
-            <button className={authMode === 'login' ? 'active' : ''} onClick={() => setAuthMode('login')} type="button">登录</button>
-            <button className={authMode === 'register' ? 'active' : ''} disabled={!publicAuthSettings.allow_registration} onClick={() => setAuthMode('register')} type="button">注册</button>
-          </div>
-          <form className="auth-form" onSubmit={handleAuthSubmit}>
-            <label>
-              用户名
-              <input value={authUsername} onChange={(event) => setAuthUsername(event.target.value)} placeholder="输入用户名" />
-            </label>
-            <label>
-              密码
-              <input type="password" value={authPassword} onChange={(event) => setAuthPassword(event.target.value)} placeholder="输入密码" />
-            </label>
-            {authError ? <div className="error-text">{authError}</div> : null}
-            <button className="primary-btn" disabled={loadingAuth} type="submit">
-              {loadingAuth ? '处理中...' : authMode === 'login' ? '登录' : '注册并进入'}
-            </button>
-            {!publicAuthSettings.allow_registration ? <div className="hint-text">当前已关闭普通用户注册</div> : null}
-            <div className="hint-text">默认管理员：`admin` / `admin123`</div>
-          </form>
+            {!setupStatusLoaded ? (
+              <div className="hint-text">正在检查系统初始化状态...</div>
+            ) : (
+              <>
+                {setupStatus.needs_admin_setup ? (
+                  <div className="hint-text">当前还没有管理员账号，请先初始化首个管理员。</div>
+                ) : (
+                  <div className="auth-tabs">
+                    <button className={authMode === 'login' ? 'active' : ''} onClick={() => setAuthMode('login')} type="button">登录</button>
+                    <button className={authMode === 'register' ? 'active' : ''} disabled={!publicAuthSettings.allow_registration} onClick={() => setAuthMode('register')} type="button">注册</button>
+                  </div>
+                )}
+                <form className="auth-form" onSubmit={handleAuthSubmit}>
+                  <label>
+                    用户名
+                    <input value={authUsername} onChange={(event) => setAuthUsername(event.target.value)} placeholder={setupStatus.needs_admin_setup ? '输入管理员用户名' : '输入用户名'} />
+                  </label>
+                  <label>
+                    密码
+                    <input type="password" value={authPassword} onChange={(event) => setAuthPassword(event.target.value)} placeholder={setupStatus.needs_admin_setup ? '设置管理员密码' : '输入密码'} />
+                  </label>
+                  {authError ? <div className="error-text">{authError}</div> : null}
+                  <button className="primary-btn" disabled={loadingAuth} type="submit">
+                    {loadingAuth ? '处理中...' : setupStatus.needs_admin_setup ? '创建管理员并进入' : authMode === 'login' ? '登录' : '注册并进入'}
+                  </button>
+                  {setupStatus.needs_admin_setup ? (
+                    <div className="hint-text">该入口只在系统尚未创建任何管理员时开放。</div>
+                  ) : !publicAuthSettings.allow_registration ? (
+                    <div className="hint-text">当前已关闭普通用户注册</div>
+                  ) : null}
+                </form>
+              </>
+            )}
           </div>
         </div>
         {dialogState ? renderDialog(dialogState, setDialogState, closeDialog) : null}
@@ -716,205 +1202,319 @@ function App() {
     return (
       <>
         <div className="admin-page">
-        <header className="admin-topbar">
-          <div className="admin-topbar-left">
-            <div className="brand-mark solid"><Shield size={18} /></div>
-            <div>
-              <h2>管理员后台</h2>
-              <p>单独页面管理供应商、用户注册、账号状态与管理员账号。</p>
+          <header className="admin-topbar">
+            <div className="admin-topbar-left">
+              <div className="brand-mark solid"><Shield size={18} /></div>
+              <div>
+                <h2>管理员后台</h2>
+                <p>把系统配置拆分到清晰的二级页面，减少信息拥挤。</p>
+              </div>
             </div>
-          </div>
-          <div className="admin-topbar-actions">
-            <button className="ghost-btn" onClick={() => navigateTo('chat')} type="button">
-              <Bot size={16} />
-              返回聊天
+            <div className="admin-topbar-actions">
+              <button className="ghost-btn" onClick={() => navigateTo('chat')} type="button">
+                <Bot size={16} />
+                返回聊天
+              </button>
+              <button className="ghost-btn" onClick={() => handleLogout()} type="button">
+                <LogOut size={16} />
+                退出登录
+              </button>
+            </div>
+          </header>
+
+          <nav className="admin-subnav">
+            <button className={adminSection === 'overview' ? 'admin-subnav-btn active' : 'admin-subnav-btn'} onClick={() => navigateToAdminSection('overview')} type="button">
+              <Settings size={16} />
+              概览
             </button>
-            <button className="ghost-btn" onClick={() => handleLogout()} type="button">
-              <LogOut size={16} />
-              退出登录
+            <button className={adminSection === 'providers' ? 'admin-subnav-btn active' : 'admin-subnav-btn'} onClick={() => navigateToAdminSection('providers')} type="button">
+              <Shield size={16} />
+              供应商管理
             </button>
-          </div>
-        </header>
+            <button className={adminSection === 'users' ? 'admin-subnav-btn active' : 'admin-subnav-btn'} onClick={() => navigateToAdminSection('users')} type="button">
+              <UserRound size={16} />
+              用户管理
+            </button>
+          </nav>
 
-        <main className="admin-main">
-          <section className="admin-grid">
-            <section className="panel-card">
-              <div className="panel-title"><Shield size={16} /> 供应商配置</div>
-              <form className="admin-form" onSubmit={submitProvider}>
-                <label>
-                  供应商名称
-                  <input value={providerForm.name} onChange={(event) => setProviderForm((prev) => ({ ...prev, name: event.target.value }))} />
-                </label>
-                <label>
-                  API URL
-                  <input value={providerForm.api_url} onChange={(event) => setProviderForm((prev) => ({ ...prev, api_url: event.target.value }))} placeholder={editingProviderId ? '编辑时必须重新填写 API URL' : 'https://.../anthropic/v1'} />
-                </label>
-                <label>
-                  API Key
-                  <input type="password" value={providerForm.api_key} onChange={(event) => setProviderForm((prev) => ({ ...prev, api_key: event.target.value }))} placeholder={editingProviderId ? '编辑时必须重新填写 key' : '输入供应商密钥'} />
-                </label>
-                <label>
-                  模型名称
-                  <input value={providerForm.model_name} onChange={(event) => setProviderForm((prev) => ({ ...prev, model_name: event.target.value }))} />
-                </label>
-                <div className="inline-grid">
-                  <label>
-                    最大上下文
-                    <input type="number" value={providerForm.max_context_window} onChange={(event) => setProviderForm((prev) => ({ ...prev, max_context_window: Number(event.target.value) }))} />
-                  </label>
-                  <label>
-                    最大输出
-                    <input type="number" value={providerForm.max_output_tokens} onChange={(event) => setProviderForm((prev) => ({ ...prev, max_output_tokens: Number(event.target.value) }))} />
-                  </label>
-                </div>
-                <div className="inline-grid three">
-                  <label className="checkbox-row">
-                    <input checked={providerForm.supports_thinking} onChange={(event) => setProviderForm((prev) => ({ ...prev, supports_thinking: event.target.checked }))} type="checkbox" />
-                    支持思考
-                  </label>
-                  <label className="checkbox-row">
-                    <input checked={providerForm.supports_vision} onChange={(event) => setProviderForm((prev) => ({ ...prev, supports_vision: event.target.checked }))} type="checkbox" />
-                    支持视觉
-                  </label>
-                  <label className="checkbox-row">
-                    <input checked={providerForm.is_enabled} onChange={(event) => setProviderForm((prev) => ({ ...prev, is_enabled: event.target.checked }))} type="checkbox" />
-                    启用
-                  </label>
-                </div>
-                <label>
-                  思考努力等级
-                  <select value={providerForm.thinking_effort} onChange={(event) => setProviderForm((prev) => ({ ...prev, thinking_effort: event.target.value }))}>
-                    <option value="low">low</option>
-                    <option value="medium">medium</option>
-                    <option value="high">high</option>
-                    <option value="max">max</option>
-                  </select>
-                </label>
-                {providerError ? <div className="error-text">{providerError}</div> : null}
-                {providerSuccess ? <div className="success-text">{providerSuccess}</div> : null}
-                <div className="action-row">
-                  <button className="primary-btn" type="submit">{editingProviderId ? '更新供应商' : '添加供应商'}</button>
-                  {editingProviderId ? (
-                    <button className="ghost-btn" onClick={() => { setEditingProviderId(null); setProviderForm(defaultProviderForm) }} type="button">取消编辑</button>
-                  ) : null}
-                </div>
-              </form>
-            </section>
-
-            <section className="panel-card">
-              <div className="panel-title"><Settings size={16} /> 管理员账号</div>
-              <form className="admin-form" onSubmit={submitAdminProfile}>
-                <label>
-                  管理员用户名
-                  <input value={adminProfile.username} onChange={(event) => setAdminProfile((prev) => ({ ...prev, username: event.target.value }))} />
-                </label>
-                <label>
-                  当前密码
-                  <input type="password" value={adminProfile.current_password} onChange={(event) => setAdminProfile((prev) => ({ ...prev, current_password: event.target.value }))} />
-                </label>
-                <label>
-                  新密码
-                  <input type="password" value={adminProfile.new_password} onChange={(event) => setAdminProfile((prev) => ({ ...prev, new_password: event.target.value }))} />
-                </label>
-                {adminProfileMessage ? <div className="success-text">{adminProfileMessage}</div> : null}
-                <button className="primary-btn" type="submit">更新管理员账号</button>
-              </form>
-            </section>
-          </section>
-
-          <section className="admin-grid user-admin-grid">
-            <section className="panel-card">
-              <div className="panel-title"><UserRound size={16} /> 用户注册与创建</div>
-              <div className="settings-stack">
-                <label className="checkbox-row checkbox-card">
-                  <input checked={adminSettings.allow_registration} onChange={(event) => void toggleAllowRegistration(event.target.checked)} type="checkbox" />
-                  <span>{adminSettings.allow_registration ? '允许普通用户注册' : '关闭普通用户注册'}</span>
-                </label>
-                <form className="admin-form" onSubmit={submitAdminUser}>
-                  <div className="inline-grid">
-                    <label>
-                      用户名
-                      <input value={userForm.username} onChange={(event) => setUserForm((prev) => ({ ...prev, username: event.target.value }))} />
-                    </label>
-                    <label>
-                      初始密码
-                      <input type="password" value={userForm.password} onChange={(event) => setUserForm((prev) => ({ ...prev, password: event.target.value }))} />
-                    </label>
-                  </div>
-                  <div className="inline-grid">
-                    <label>
-                      角色
-                      <select value={userForm.role} onChange={(event) => setUserForm((prev) => ({ ...prev, role: event.target.value as 'admin' | 'user' }))}>
-                        <option value="user">普通用户</option>
-                        <option value="admin">管理员</option>
-                      </select>
-                    </label>
-                    <label className="checkbox-row checkbox-row-inline">
-                      <input checked={userForm.is_enabled} onChange={(event) => setUserForm((prev) => ({ ...prev, is_enabled: event.target.checked }))} type="checkbox" />
-                      创建后立即启用
-                    </label>
-                  </div>
-                  {userAdminMessage ? <div className={userAdminError ? 'error-text' : 'success-text'}>{userAdminMessage}</div> : null}
-                  <button className="primary-btn" type="submit">手动添加用户</button>
-                </form>
-              </div>
-            </section>
-
-            <section className="panel-card provider-table-card">
-              <div className="panel-title"><LayoutDashboard size={16} /> 用户列表</div>
-              <div className="user-search-bar">
-                <input placeholder="搜索用户名" value={userSearch} onChange={(event) => setUserSearch(event.target.value)} />
-              </div>
-              <div className="provider-table">
-                {filteredAdminUsers.map((managedUser) => (
-                  <div className="provider-row user-row" key={managedUser.id}>
-                    <div>
-                      <strong>{managedUser.username}</strong>
-                      <span>{managedUser.role === 'admin' ? '管理员' : '普通用户'}</span>
+          <main className="admin-main">
+            {adminSection === 'overview' ? (
+              <>
+                <section className="admin-overview-grid">
+                  <section className="panel-card admin-hero-card">
+                    <div className="panel-title"><Sparkles size={16} /> 管理概览</div>
+                    <h3>把高频操作拆开，减少后台页面的视觉负担。</h3>
+                    <p>供应商维护、用户管理和管理员设置现在分布在不同子页里，修改时更聚焦。</p>
+                    <div className="admin-metric-grid">
+                      <div className="admin-metric-card">
+                        <strong>{adminProviders.length}</strong>
+                        <span>供应商总数</span>
+                        <small>{enabledProvidersCount} 个启用中</small>
+                      </div>
+                      <div className="admin-metric-card">
+                        <strong>{adminUsers.length}</strong>
+                        <span>用户总数</span>
+                        <small>{enabledUsersCount} 个启用中</small>
+                      </div>
+                      <div className="admin-metric-card">
+                        <strong>{adminSettings.allow_registration ? '开启' : '关闭'}</strong>
+                        <span>注册状态</span>
+                        <small>{adminSettings.allow_registration ? '允许普通用户注册' : '仅管理员手动创建'}</small>
+                      </div>
                     </div>
-                    <div className="provider-flags">
-                      <span className="meta-chip">{managedUser.is_enabled ? '启用中' : '已停用'}</span>
-                      <span className="meta-chip">创建于 {formatDateTime(managedUser.created_at)}</span>
+                    <div className="action-row">
+                      <button className="primary-btn" onClick={() => navigateToAdminSection('providers')} type="button">去管理供应商</button>
+                      <button className="ghost-btn" onClick={() => navigateToAdminSection('users')} type="button">去管理用户</button>
                     </div>
-                    <div className="provider-actions">
-                      <button className="ghost-btn" onClick={() => void resetAdminUserPassword(managedUser)} type="button">重置密码</button>
-                      <button className="ghost-btn" onClick={() => void toggleUserEnabled(managedUser)} type="button">
-                        {managedUser.is_enabled ? '停用' : '启用'}
-                      </button>
-                      <button className="ghost-btn danger-text" onClick={() => void removeAdminUser(managedUser)} type="button">删除</button>
-                    </div>
-                  </div>
-                ))}
-                {filteredAdminUsers.length === 0 ? <div className="empty-tip">没有匹配的用户。</div> : null}
-              </div>
-            </section>
-          </section>
+                  </section>
 
-          <section className="panel-card provider-table-card">
-            <div className="panel-title"><LayoutDashboard size={16} /> 已配置供应商</div>
-            <div className="provider-table">
-              {adminProviders.map((provider) => (
-                <div className="provider-row" key={provider.id}>
+                  <section className="admin-stack">
+                    <section className="panel-card">
+                      <div className="panel-title"><Settings size={16} /> 管理员账号</div>
+                      <form className="admin-form" onSubmit={submitAdminProfile}>
+                        <label>
+                          管理员用户名
+                          <input value={adminProfile.username} onChange={(event) => setAdminProfile((prev) => ({ ...prev, username: event.target.value }))} />
+                        </label>
+                        <label>
+                          当前密码
+                          <input type="password" value={adminProfile.current_password} onChange={(event) => setAdminProfile((prev) => ({ ...prev, current_password: event.target.value }))} />
+                        </label>
+                        <label>
+                          新密码
+                          <input type="password" value={adminProfile.new_password} onChange={(event) => setAdminProfile((prev) => ({ ...prev, new_password: event.target.value }))} />
+                        </label>
+                        {adminProfileMessage ? <div className="success-text">{adminProfileMessage}</div> : null}
+                        <button className="primary-btn" type="submit">更新管理员账号</button>
+                      </form>
+                    </section>
+
+                    <section className="panel-card">
+                      <div className="panel-title"><UserRound size={16} /> 注册设置</div>
+                      <div className="settings-stack">
+                        <label className="checkbox-row checkbox-card">
+                          <input checked={adminSettings.allow_registration} onChange={(event) => void toggleAllowRegistration(event.target.checked)} type="checkbox" />
+                          <span>{adminSettings.allow_registration ? '允许普通用户注册' : '关闭普通用户注册'}</span>
+                        </label>
+                        {userAdminMessage ? <div className={userAdminError ? 'error-text' : 'success-text'}>{userAdminMessage}</div> : null}
+                      </div>
+                    </section>
+                  </section>
+                </section>
+              </>
+            ) : null}
+
+            {adminSection === 'providers' ? (
+              <>
+                <section className="panel-card admin-section-intro">
                   <div>
-                    <strong>{provider.name}</strong>
-                    <span>{provider.model_name}</span>
+                    <div className="panel-title"><Shield size={16} /> 供应商管理</div>
+                    <p>单独维护模型接入、能力开关和输出限制。编辑已有供应商时，请重新填写连接 URL 和 Key。</p>
                   </div>
-                  <div className="provider-flags">
-                    {provider.supports_thinking ? <span className="meta-chip">思考</span> : null}
-                    {provider.supports_vision ? <span className="meta-chip">视觉</span> : null}
-                    <span className="meta-chip">输出 {provider.max_output_tokens}</span>
-                    <span className="meta-chip">{provider.is_enabled ? '启用中' : '已禁用'}</span>
+                  <div className="meta-chip soft compact">共 {adminProviders.length} 个供应商</div>
+                </section>
+
+                <section className="admin-detail-grid">
+                  <section className="panel-card">
+                    <div className="panel-title"><Shield size={16} /> {editingProviderId ? '编辑供应商' : '添加供应商'}</div>
+                    <form className="admin-form" onSubmit={submitProvider}>
+                      <label>
+                        供应商名称
+                        <input value={providerForm.name} onChange={(event) => setProviderForm((prev) => ({ ...prev, name: event.target.value }))} />
+                      </label>
+                      {editingProviderId ? (
+                        <div className="connection-hint-card">
+                          <div>
+                            <strong>编辑时需要重新填写连接信息</strong>
+                            <span>当前后端不会保留空白 URL / Key，请按实际值重新提交。</span>
+                          </div>
+                        </div>
+                      ) : null}
+                      <label>
+                        API URL
+                        <input
+                          value={providerForm.api_url}
+                          onChange={(event) => setProviderForm((prev) => ({ ...prev, api_url: event.target.value }))}
+                          placeholder={providerApiUrlPlaceholder}
+                        />
+                      </label>
+                      <label>
+                        API Key
+                        <input
+                          type="password"
+                          value={providerForm.api_key}
+                          onChange={(event) => setProviderForm((prev) => ({ ...prev, api_key: event.target.value }))}
+                          placeholder="输入供应商密钥"
+                        />
+                      </label>
+                      <label>
+                        模型名称
+                        <input value={providerForm.model_name} onChange={(event) => setProviderForm((prev) => ({ ...prev, model_name: event.target.value }))} />
+                      </label>
+                      <div className="inline-grid">
+                        <label>
+                          最大上下文
+                          <input type="number" value={providerForm.max_context_window} onChange={(event) => setProviderForm((prev) => ({ ...prev, max_context_window: Number(event.target.value) }))} />
+                        </label>
+                        <label>
+                          最大输出
+                          <input type="number" value={providerForm.max_output_tokens} onChange={(event) => setProviderForm((prev) => ({ ...prev, max_output_tokens: Number(event.target.value) }))} />
+                        </label>
+                      </div>
+                      <div className="inline-grid three">
+                        <label className="checkbox-row">
+                          <input checked={providerForm.supports_thinking} onChange={(event) => setProviderForm((prev) => ({ ...prev, supports_thinking: event.target.checked }))} type="checkbox" />
+                          支持思考
+                        </label>
+                        <label className="checkbox-row">
+                          <input checked={providerForm.supports_vision} onChange={(event) => setProviderForm((prev) => ({ ...prev, supports_vision: event.target.checked }))} type="checkbox" />
+                          支持视觉
+                        </label>
+                      </div>
+                      <label className="checkbox-row">
+                        <input checked={providerForm.is_enabled} onChange={(event) => setProviderForm((prev) => ({ ...prev, is_enabled: event.target.checked }))} type="checkbox" />
+                        启用
+                      </label>
+                      <label>
+                        思考努力等级
+                        <select
+                          value={providerForm.thinking_effort}
+                          onChange={(event) => setProviderForm((prev) => ({ ...prev, thinking_effort: event.target.value as ThinkingEffort }))}
+                        >
+                          {thinkingEffortOptions.map((option) => (
+                            <option key={option} value={option}>{option}</option>
+                          ))}
+                        </select>
+                      </label>
+                      {providerError ? <div className="error-text">{providerError}</div> : null}
+                      {providerSuccess ? <div className="success-text">{providerSuccess}</div> : null}
+                      <div className="action-row">
+                        <button className="primary-btn" type="submit">{editingProviderId ? '保存修改' : '添加供应商'}</button>
+                        {editingProviderId ? (
+                          <button
+                            className="ghost-btn"
+                            onClick={() => {
+                              setEditingProviderId(null)
+                              setProviderForm(defaultProviderForm)
+                            }}
+                            type="button"
+                          >
+                            取消编辑
+                          </button>
+                        ) : null}
+                      </div>
+                    </form>
+                  </section>
+
+                  <section className="panel-card provider-table-card">
+                    <div className="panel-title"><LayoutDashboard size={16} /> 已配置供应商</div>
+                    <div className="provider-table">
+                      {adminProviders.map((provider) => (
+                        <div className="provider-row" key={provider.id}>
+                          <div>
+                            <strong>{provider.name}</strong>
+                            <span>{provider.model_name}</span>
+                          </div>
+                          <div className="provider-flags">
+                            <span className="meta-chip">Anthropic Messages</span>
+                            {provider.supports_thinking ? <span className="meta-chip">思考</span> : null}
+                            {provider.supports_vision ? <span className="meta-chip">视觉</span> : null}
+                            <span className="meta-chip">输出 {provider.max_output_tokens}</span>
+                            <span className="meta-chip">{provider.is_enabled ? '启用中' : '已禁用'}</span>
+                          </div>
+                          <div className="provider-actions">
+                            <span className="masked-key">{provider.api_key_masked}</span>
+                            <button className="ghost-btn" onClick={() => editProvider(provider)} type="button">编辑</button>
+                            <button className="ghost-btn danger-text" onClick={() => void removeProvider(provider)} type="button">删除</button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </section>
+                </section>
+              </>
+            ) : null}
+
+            {adminSection === 'users' ? (
+              <>
+                <section className="panel-card admin-section-intro">
+                  <div>
+                    <div className="panel-title"><UserRound size={16} /> 用户管理</div>
+                    <p>把注册开关、手动创建、启用状态和密码重置集中到用户子页，降低后台操作噪音。</p>
                   </div>
-                  <div className="provider-actions">
-                    <span className="masked-key">{provider.api_key_masked}</span>
-                    <button className="ghost-btn" onClick={() => editProvider(provider)} type="button">编辑</button>
-                    <button className="ghost-btn danger-text" onClick={() => void removeProvider(provider)} type="button">删除</button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </section>
-        </main>
+                  <div className="meta-chip soft compact">共 {adminUsers.length} 个用户</div>
+                </section>
+
+                <section className="admin-detail-grid">
+                  <section className="panel-card">
+                    <div className="panel-title"><UserRound size={16} /> 注册与创建</div>
+                    <div className="settings-stack">
+                      <label className="checkbox-row checkbox-card">
+                        <input checked={adminSettings.allow_registration} onChange={(event) => void toggleAllowRegistration(event.target.checked)} type="checkbox" />
+                        <span>{adminSettings.allow_registration ? '允许普通用户注册' : '关闭普通用户注册'}</span>
+                      </label>
+                      <form className="admin-form" onSubmit={submitAdminUser}>
+                        <div className="inline-grid">
+                          <label>
+                            用户名
+                            <input value={userForm.username} onChange={(event) => setUserForm((prev) => ({ ...prev, username: event.target.value }))} />
+                          </label>
+                          <label>
+                            初始密码
+                            <input type="password" value={userForm.password} onChange={(event) => setUserForm((prev) => ({ ...prev, password: event.target.value }))} />
+                          </label>
+                        </div>
+                        <div className="inline-grid">
+                          <label>
+                            角色
+                            <select value={userForm.role} onChange={(event) => setUserForm((prev) => ({ ...prev, role: event.target.value as 'admin' | 'user' }))}>
+                              <option value="user">普通用户</option>
+                              <option value="admin">管理员</option>
+                            </select>
+                          </label>
+                          <label className="checkbox-row checkbox-row-inline">
+                            <input checked={userForm.is_enabled} onChange={(event) => setUserForm((prev) => ({ ...prev, is_enabled: event.target.checked }))} type="checkbox" />
+                            创建后立即启用
+                          </label>
+                        </div>
+                        {userAdminMessage ? <div className={userAdminError ? 'error-text' : 'success-text'}>{userAdminMessage}</div> : null}
+                        <button className="primary-btn" type="submit">手动添加用户</button>
+                      </form>
+                    </div>
+                  </section>
+
+                  <section className="panel-card provider-table-card">
+                    <div className="panel-title"><LayoutDashboard size={16} /> 用户列表</div>
+                    <div className="user-search-bar">
+                      <input placeholder="搜索用户名" value={userSearch} onChange={(event) => setUserSearch(event.target.value)} />
+                    </div>
+                    <div className="provider-table">
+                      {filteredAdminUsers.map((managedUser) => (
+                        <div className="provider-row user-row" key={managedUser.id}>
+                          <div>
+                            <strong>{managedUser.username}</strong>
+                            <span>{managedUser.role === 'admin' ? '管理员' : '普通用户'}</span>
+                          </div>
+                          <div className="provider-flags">
+                            <span className="meta-chip">{managedUser.is_enabled ? '启用中' : '已停用'}</span>
+                            <span className="meta-chip">创建于 {formatDateTime(managedUser.created_at)}</span>
+                          </div>
+                          <div className="provider-actions">
+                            <button className="ghost-btn" onClick={() => void resetAdminUserPassword(managedUser)} type="button">重置密码</button>
+                            <button className="ghost-btn" onClick={() => void toggleUserEnabled(managedUser)} type="button">
+                              {managedUser.is_enabled ? '停用' : '启用'}
+                            </button>
+                            <button className="ghost-btn danger-text" onClick={() => void removeAdminUser(managedUser)} type="button">删除</button>
+                          </div>
+                        </div>
+                      ))}
+                      {filteredAdminUsers.length === 0 ? <div className="empty-tip">没有匹配的用户。</div> : null}
+                    </div>
+                  </section>
+                </section>
+              </>
+            ) : null}
+          </main>
         </div>
         {dialogState ? renderDialog(dialogState, setDialogState, closeDialog) : null}
       </>
@@ -939,7 +1539,13 @@ function App() {
             </button>
           </div>
 
-          <button className={sidebarCollapsed ? 'new-chat-btn icon-only' : 'new-chat-btn'} onClick={startNewConversation} title="开启新对话" type="button">
+          <button
+            className={sidebarCollapsed ? 'new-chat-btn icon-only' : 'new-chat-btn'}
+            disabled={chatLoading}
+            onClick={startNewConversation}
+            title="开启新对话"
+            type="button"
+          >
             <MessageSquarePlus size={16} />
             {sidebarCollapsed ? null : '开启新对话'}
           </button>
@@ -950,15 +1556,34 @@ function App() {
           {!sidebarCollapsed && conversations.length === 0 ? <div className="empty-tip">还没有会话，发一条消息开始。</div> : null}
           {conversations.map((conversation) => (
             <div key={conversation.id} className={activeConversationId === conversation.id ? 'conversation-item active' : 'conversation-item'}>
-              <button className="conversation-main" onClick={() => void openConversation(conversation.id)} type="button">
+              <button
+                className="conversation-main"
+                disabled={chatLoading}
+                onClick={() => void openConversation(conversation.id)}
+                type="button"
+              >
                 <span>{sidebarCollapsed ? conversation.title.slice(0, 1) : conversation.title}</span>
                 {sidebarCollapsed ? null : <small>{conversation.provider_name} / {conversation.model_name}</small>}
               </button>
               <div className={sidebarCollapsed ? 'conversation-actions hidden' : 'conversation-actions'}>
-                <button aria-label="重命名会话" className="mini-icon-btn" onClick={() => void renameConversation(conversation)} title="重命名会话" type="button">
+                <button
+                  aria-label="重命名会话"
+                  className="mini-icon-btn"
+                  disabled={chatLoading}
+                  onClick={() => void renameConversation(conversation)}
+                  title="重命名会话"
+                  type="button"
+                >
                   <Pencil size={14} />
                 </button>
-                <button aria-label="删除会话" className="mini-icon-btn danger" onClick={() => void removeConversation(conversation)} title="删除会话" type="button">
+                <button
+                  aria-label="删除会话"
+                  className="mini-icon-btn danger"
+                  disabled={chatLoading}
+                  onClick={() => void removeConversation(conversation)}
+                  title="删除会话"
+                  type="button"
+                >
                   <Trash2 size={14} />
                 </button>
               </div>
@@ -1014,11 +1639,12 @@ function App() {
                     <time>{formatDateTime(message.created_at)}</time>
                   </div>
                   {message.thinking_text ? (
-                    <details className="thinking-box">
-                      <summary><BrainCircuit size={15} /> 已思考</summary>
-                      <MarkdownView content={message.thinking_text} />
-                    </details>
+                    <ThinkingPanel
+                      content={message.thinking_text}
+                      label={formatThinkingLabel(sumThinkingDuration(message.activities), false)}
+                    />
                   ) : null}
+                  {toolActivities(message.activities).length ? <ActivityList activities={toolActivities(message.activities)} /> : null}
                   <div className={message.role === 'user' ? 'message-bubble user' : 'message-bubble assistant'}>
                     <div className="markdown-body">
                       <MarkdownView content={messagePlainText(message.content)} />
@@ -1053,14 +1679,17 @@ function App() {
                 <article className="message-row assistant">
                   <div className="message-meta-row">
                     <span className="message-role">{selectedProvider?.name ?? 'AI'}</span>
-                    <time>生成中</time>
+                    <time>{selectedProvider?.model_name ?? ''}</time>
                   </div>
                   {streamingAssistant.thinking ? (
-                    <details className="thinking-box" open>
-                      <summary><BrainCircuit size={15} /> 已思考</summary>
-                      <MarkdownView content={streamingAssistant.thinking} />
-                    </details>
+                    <ThinkingPanel
+                      content={streamingAssistant.thinking}
+                      label={formatThinkingLabel(sumThinkingDuration(streamingAssistant.activities), true)}
+                      open={streamThinkingExpanded}
+                      onToggle={handleStreamThinkingToggle}
+                    />
                   ) : null}
+                  <ActivityList activities={toolActivities(streamingAssistant.activities)} />
                   <div className="message-bubble assistant stream">
                     <div className="markdown-body">
                       <MarkdownView content={streamingAssistant.text || '...'} />
@@ -1073,13 +1702,17 @@ function App() {
           ) : null}
 
           <form className={hasVisibleConversation ? 'composer docked compact deepseekish' : 'composer docked center compact deepseekish'} onSubmit={handleSendMessage}>
-            <textarea
-              placeholder={selectedProvider ? `给 ${selectedProvider.name} 发送消息` : '请先让管理员添加供应商'}
-              value={input}
-              onChange={(event) => setInput(event.target.value)}
-              onKeyDown={handleComposerKeyDown}
-              rows={messages.length === 0 ? 4 : 3}
-            />
+            <div className="composer-input-shell">
+              <textarea
+                className={chatLoading ? 'composer-textarea busy' : 'composer-textarea'}
+                placeholder={chatLoading ? '' : (selectedProvider ? `给 ${selectedProvider.name} 发送消息` : '请先让管理员添加供应商')}
+                value={input}
+                onChange={(event) => setInput(event.target.value)}
+                onKeyDown={handleComposerKeyDown}
+                rows={messages.length === 0 ? 3 : 2}
+              />
+              {chatLoading ? <div className="loading-text in-composer">{enableThinking ? '正在思考并回答...' : '正在回答...'}</div> : null}
+            </div>
 
               {attachments.length ? (
                 <div className="attachment-strip">
@@ -1108,13 +1741,41 @@ function App() {
                   </button>
                 ) : null}
                 {selectedProvider?.supports_thinking && enableThinking ? (
-                  <select value={effort} onChange={(event) => setEffort(event.target.value as 'low' | 'medium' | 'high' | 'max')}>
-                    <option value="low">low</option>
-                    <option value="medium">medium</option>
-                    <option value="high">high</option>
-                    <option value="max">max</option>
+                  <select value={effort} onChange={(event) => setEffort(event.target.value as ThinkingEffort)}>
+                    {thinkingEffortOptions.map((option) => (
+                      <option key={option} value={option}>{option}</option>
+                    ))}
                   </select>
                 ) : null}
+                <button
+                  className={enableSearch ? 'tool-btn active' : 'tool-btn'}
+                  onClick={() => {
+                    setChatError('')
+                    setEnableSearch((value) => !value)
+                  }}
+                  type="button"
+                >
+                  <Sparkles size={15} />
+                  联网搜索
+                </button>
+                <select
+                  disabled={!enableSearch}
+                  value={searchProvider}
+                  onChange={(event) => {
+                    setChatError('')
+                    setSearchProvider(event.target.value as SearchProviderKind)
+                  }}
+                >
+                  {searchProviderOptions.map((option) => {
+                    const status = searchProviders?.[option]
+                    const label = searchProviderLabel(option)
+                    return (
+                      <option key={option} value={option}>
+                        {status && !isSearchProviderAvailable(status) ? `${label}（不可用）` : label}
+                      </option>
+                    )
+                  })}
+                </select>
                 <select className="provider-select inline" value={selectedProviderId ?? ''} onChange={(event) => setSelectedProviderId(Number(event.target.value))}>
                   {providers.map((provider) => (
                     <option key={provider.id} value={provider.id}>{provider.name} / {provider.model_name}</option>
@@ -1128,14 +1789,19 @@ function App() {
                     <Eye size={17} />
                   </button>
                 ) : null}
-                <button className="send-btn" disabled={chatLoading || !selectedProviderId} type="submit">
-                  <SendHorizonal size={17} />
-                </button>
+                {chatLoading ? (
+                  <button className="send-btn stop" onClick={stopStreaming} type="button">
+                    <Square size={14} />
+                  </button>
+                ) : (
+                  <button className="send-btn" disabled={chatLoading || !selectedProviderId} type="submit">
+                    <SendHorizonal size={17} />
+                  </button>
+                )}
               </div>
             </div>
 
             <input accept="image/jpeg,image/png,image/gif,image/webp" hidden multiple onChange={handleFileChange} ref={fileInputRef} type="file" />
-            {chatLoading ? <div className="loading-text">模型正在生成回复...</div> : null}
             {chatError ? <div className="error-text">{chatError}</div> : null}
           </form>
         </div>

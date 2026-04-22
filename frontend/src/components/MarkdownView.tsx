@@ -6,11 +6,15 @@ import 'katex/dist/katex.min.css'
 
 type Props = {
   content: string
+  enableMath?: boolean
 }
 
-export function MarkdownView({ content }: Props) {
+export function MarkdownView({ content, enableMath = true }: Props) {
+  const remarkPlugins = enableMath ? [remarkGfm, remarkMath] : [remarkGfm]
+  const rehypePlugins = enableMath ? [rehypeKatex] : []
+
   return (
-    <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}>
+    <ReactMarkdown remarkPlugins={remarkPlugins} rehypePlugins={rehypePlugins}>
       {content}
     </ReactMarkdown>
   )

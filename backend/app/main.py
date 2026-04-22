@@ -1,31 +1,49 @@
 from __future__ import annotations
 
-import base64
-import hashlib
-import hmac
+import asyncio
 import json
 import os
-import secrets
 import sqlite3
 from contextlib import closing
-from datetime import datetime, timedelta, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from app.admin_setup import create_initial_admin, has_admin_account
+from app.chat_service import (
+    SearchProviderUnavailableError,
+    commit_stream_chat,
+    prepare_stream_chat,
+    rollback_stream_chat,
+)
+from app import chat_service, db
+from app.auth import (
+    create_session,
+    ensure_other_enabled_admin_exists,
+    get_current_user,
+    get_token,
+    get_user_by_id,
+    hash_password,
+    normalize_username,
+    require_admin,
+    row_to_user,
+    utcnow,
+    verify_password,
+)
+from app.db import get_conn
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = BASE_DIR / "data"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH = DATA_DIR / "app.db"
+BASE_DIR = db.BASE_DIR
 ANTHROPIC_VERSION = "2023-06-01"
-TOKEN_EXPIRE_DAYS = 30
+ALLOW_REGISTRATION_KEY = "allow_registration"
+SEARCH_TAVILY_API_KEY = "search_tavily_api_key"
+SEARCH_TAVILY_ENABLED = "search_tavily_enabled"
 
 
 app = FastAPI(title="Anthropic Chat Console")
@@ -45,6 +63,11 @@ class RegisterPayload(BaseModel):
 
 class LoginPayload(RegisterPayload):
     pass
+
+
+class SetupAdminPayload(BaseModel):
+    username: str = Field(min_length=3, max_length=32)
+    password: str = Field(min_length=6, max_length=128)
 
 
 class AdminProfilePayload(BaseModel):
@@ -85,10 +108,20 @@ class ProviderPayload(BaseModel):
     is_enabled: bool = True
 
 
+class SearchProviderSelection(str, Enum):
+    exa = "exa"
+    tavily = "tavily"
+
+
 class ChatAttachment(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     media_type: str
     data: str
+
+
+class SearchProviderConfigPayload(BaseModel):
+    api_key: str = Field(max_length=500)
+    is_enabled: bool
 
 
 class ChatPayload(BaseModel):
@@ -96,42 +129,14 @@ class ChatPayload(BaseModel):
     conversation_id: int | None = None
     text: str = Field(default="", max_length=20000)
     enable_thinking: bool = False
+    enable_search: bool = False
+    search_provider: SearchProviderSelection | None = None
     effort: str = "high"
     attachments: list[ChatAttachment] = Field(default_factory=list)
 
 
 class ConversationTitlePayload(BaseModel):
     title: str = Field(min_length=1, max_length=80)
-
-
-def utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def normalize_username(username: str) -> str:
-    value = username.strip()
-    if not value:
-        raise HTTPException(status_code=400, detail="用户名不能为空")
-    return value
-
-
-def hash_password(password: str, salt: str | None = None) -> tuple[str, str]:
-    salt = salt or secrets.token_hex(16)
-    hashed = hashlib.pbkdf2_hmac(
-        "sha256", password.encode("utf-8"), salt.encode("utf-8"), 100000
-    )
-    return salt, hashed.hex()
-
-
-def verify_password(password: str, salt: str, password_hash: str) -> bool:
-    _, computed = hash_password(password, salt)
-    return hmac.compare_digest(computed, password_hash)
 
 
 def ensure_tables() -> None:
@@ -210,45 +215,27 @@ def ensure_tables() -> None:
                 "ALTER TABLE users ADD COLUMN is_enabled INTEGER NOT NULL DEFAULT 1"
             )
 
-        registration_row = conn.execute(
-            "SELECT key FROM app_settings WHERE key = 'allow_registration'"
-        ).fetchone()
-        if not registration_row:
+        default_settings = {
+            ALLOW_REGISTRATION_KEY: "1",
+            SEARCH_TAVILY_API_KEY: "",
+            SEARCH_TAVILY_ENABLED: "0",
+        }
+        for key, value in default_settings.items():
+            setting_row = conn.execute(
+                "SELECT key FROM app_settings WHERE key = ?",
+                (key,),
+            ).fetchone()
+            if setting_row:
+                continue
             conn.execute(
-                "INSERT INTO app_settings (key, value, updated_at) VALUES ('allow_registration', '1', ?)",
-                (utcnow(),),
+                "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)",
+                (key, value, utcnow()),
             )
         conn.commit()
-
-
-def ensure_admin() -> None:
-    with closing(get_conn()) as conn:
-        existing = conn.execute(
-            "SELECT id FROM users WHERE role = 'admin' LIMIT 1"
-        ).fetchone()
-        if existing:
-            return
-        salt, password_hash = hash_password("admin123")
-        conn.execute(
-            "INSERT INTO users (username, password_salt, password_hash, role, created_at) VALUES (?, ?, ?, 'admin', ?)",
-            ("admin", salt, password_hash, utcnow()),
-        )
-        conn.commit()
-
 
 @app.on_event("startup")
 def on_startup() -> None:
     ensure_tables()
-    ensure_admin()
-
-
-def row_to_user(row: sqlite3.Row) -> dict[str, Any]:
-    return {
-        "id": row["id"],
-        "username": row["username"],
-        "role": row["role"],
-        "is_enabled": bool(row["is_enabled"]),
-    }
 
 
 def row_to_admin_user(row: sqlite3.Row) -> dict[str, Any]:
@@ -262,11 +249,79 @@ def row_to_admin_user(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def get_allow_registration() -> bool:
+    return get_setting_bool(ALLOW_REGISTRATION_KEY, True)
+
+
+def get_setting_value(key: str, default: str = "") -> str:
     with closing(get_conn()) as conn:
         row = conn.execute(
-            "SELECT value FROM app_settings WHERE key = 'allow_registration'"
+            "SELECT value FROM app_settings WHERE key = ?",
+            (key,),
         ).fetchone()
-    return row is None or row["value"] == "1"
+    if not row:
+        return default
+    return row["value"]
+
+
+def get_setting_bool(key: str, default: bool = False) -> bool:
+    return get_setting_value(key, "1" if default else "0") == "1"
+
+
+def upsert_setting_value(key: str, value: str) -> None:
+    with closing(get_conn()) as conn:
+        conn.execute(
+            """
+            INSERT INTO app_settings (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (key, value, utcnow()),
+        )
+        conn.commit()
+
+
+def get_tavily_config() -> dict[str, Any]:
+    api_key = get_setting_value(SEARCH_TAVILY_API_KEY, "").strip()
+    is_enabled = get_setting_bool(SEARCH_TAVILY_ENABLED, False)
+    return {
+        "api_key": api_key,
+        "is_enabled": is_enabled,
+        "is_configured": bool(api_key),
+    }
+
+
+def store_tavily_config(api_key: str, is_enabled: bool) -> None:
+    upsert_setting_value(SEARCH_TAVILY_API_KEY, api_key)
+    upsert_setting_value(SEARCH_TAVILY_ENABLED, "1" if is_enabled else "0")
+
+
+def admin_search_provider_status() -> dict[str, dict[str, Any]]:
+    tavily_config = get_tavily_config()
+    return {
+        "exa": {
+            "kind": "exa",
+            "name": "Exa",
+            "is_enabled": True,
+            "is_configured": True,
+        },
+        "tavily": {
+            "kind": "tavily",
+            "name": "Tavily",
+            "is_enabled": tavily_config["is_enabled"],
+            "is_configured": tavily_config["is_configured"],
+        },
+    }
+
+
+def public_search_provider_status() -> dict[str, dict[str, bool]]:
+    status = admin_search_provider_status()
+    return {
+        kind: {
+            "is_enabled": bool(provider["is_enabled"]),
+            "is_configured": bool(provider["is_configured"]),
+        }
+        for kind, provider in status.items()
+    }
 
 
 def provider_public(row: sqlite3.Row) -> dict[str, Any]:
@@ -295,79 +350,6 @@ def mask_secret(value: str) -> str:
     if len(value) <= 8:
         return "*" * len(value)
     return f"{value[:4]}{'*' * (len(value) - 8)}{value[-4:]}"
-
-
-def create_session(user_id: int) -> str:
-    token = secrets.token_urlsafe(32)
-    now = datetime.now(timezone.utc)
-    expires_at = now + timedelta(days=TOKEN_EXPIRE_DAYS)
-    with closing(get_conn()) as conn:
-        conn.execute(
-            "INSERT INTO sessions (user_id, token, created_at, expires_at) VALUES (?, ?, ?, ?)",
-            (user_id, token, now.isoformat(), expires_at.isoformat()),
-        )
-        conn.commit()
-    return token
-
-
-def get_token(authorization: str | None) -> str:
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="未登录")
-    token = authorization.removeprefix("Bearer ").strip()
-    if not token:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="未登录")
-    return token
-
-
-def get_current_user(
-    authorization: str | None = Header(default=None),
-) -> dict[str, Any]:
-    token = get_token(authorization)
-    with closing(get_conn()) as conn:
-        row = conn.execute(
-            """
-            SELECT users.id, users.username, users.role, users.is_enabled, sessions.expires_at
-            FROM sessions
-            JOIN users ON users.id = sessions.user_id
-            WHERE sessions.token = ?
-            """,
-            (token,),
-        ).fetchone()
-        if not row:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED, detail="登录已失效"
-            )
-        if datetime.fromisoformat(row["expires_at"]) < datetime.now(timezone.utc):
-            conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
-            conn.commit()
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED, detail="登录已过期"
-            )
-        if not row["is_enabled"]:
-            conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
-            conn.commit()
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN, detail="账号已停用"
-            )
-        return row_to_user(row)
-
-
-def require_admin(user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
-    if user["role"] != "admin":
-        raise HTTPException(status_code=403, detail="需要管理员权限")
-    return user
-
-
-def fetch_provider(provider_id: int, include_disabled: bool = False) -> sqlite3.Row:
-    with closing(get_conn()) as conn:
-        row = conn.execute(
-            "SELECT * FROM providers WHERE id = ?", (provider_id,)
-        ).fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="供应商不存在")
-        if not include_disabled and not row["is_enabled"]:
-            raise HTTPException(status_code=400, detail="供应商已禁用")
-        return row
 
 
 def fetch_conversation(conversation_id: int, user_id: int) -> sqlite3.Row:
@@ -405,20 +387,6 @@ def guess_media_type(filename: str) -> str:
     }.get(ext, "application/octet-stream")
 
 
-def validate_attachment(attachment: ChatAttachment) -> None:
-    allowed = {"image/jpeg", "image/png", "image/gif", "image/webp"}
-    if attachment.media_type not in allowed:
-        raise HTTPException(
-            status_code=400, detail=f"不支持的图片类型: {attachment.media_type}"
-        )
-    try:
-        base64.b64decode(attachment.data, validate=True)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(
-            status_code=400, detail="图片不是合法的 base64 数据"
-        ) from exc
-
-
 def ensure_anthropic_messages_url(api_url: str) -> str:
     parsed = urlparse(api_url)
     if not parsed.scheme or not parsed.netloc:
@@ -427,173 +395,6 @@ def ensure_anthropic_messages_url(api_url: str) -> str:
     if normalized.endswith("/messages"):
         return normalized
     return f"{normalized}/messages"
-
-
-def message_to_anthropic_content(
-    text: str, attachments: list[ChatAttachment]
-) -> str | list[dict[str, Any]]:
-    if not attachments:
-        return text
-    blocks: list[dict[str, Any]] = []
-    for attachment in attachments:
-        validate_attachment(attachment)
-        blocks.append(
-            {
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": attachment.media_type,
-                    "data": attachment.data,
-                },
-            }
-        )
-    if text.strip():
-        blocks.append({"type": "text", "text": text})
-    return blocks
-
-
-def build_history(conversation_id: int) -> list[dict[str, Any]]:
-    with closing(get_conn()) as conn:
-        rows = conn.execute(
-            "SELECT role, content_text, content_json FROM messages WHERE conversation_id = ? ORDER BY id",
-            (conversation_id,),
-        ).fetchall()
-    history: list[dict[str, Any]] = []
-    for row in rows:
-        content: Any = row["content_text"]
-        if row["content_json"]:
-            content = json.loads(row["content_json"])
-        history.append({"role": row["role"], "content": content})
-    return history
-
-
-def build_chat_request_payload(
-    provider: sqlite3.Row,
-    history: list[dict[str, Any]],
-    payload: ChatPayload,
-    stream: bool = False,
-) -> dict[str, Any]:
-    request_payload: dict[str, Any] = {
-        "model": provider["model_name"],
-        "max_tokens": provider["max_output_tokens"],
-        "messages": history,
-    }
-    if payload.enable_thinking and provider["supports_thinking"]:
-        request_payload["thinking"] = {"type": "adaptive"}
-        request_payload["output_config"] = {
-            "effort": payload.effort or provider["thinking_effort"]
-        }
-    if stream:
-        request_payload["stream"] = True
-    return request_payload
-
-
-def prepare_chat_context(
-    payload: ChatPayload, user: dict[str, Any]
-) -> tuple[sqlite3.Row, int, Any]:
-    if not payload.text.strip() and not payload.attachments:
-        raise HTTPException(status_code=400, detail="消息内容不能为空")
-
-    provider = fetch_provider(payload.provider_id)
-    if payload.enable_thinking and not provider["supports_thinking"]:
-        raise HTTPException(status_code=400, detail="当前模型不支持思考")
-    if payload.attachments and not provider["supports_vision"]:
-        raise HTTPException(status_code=400, detail="当前模型不支持图片")
-
-    now = utcnow()
-    content = message_to_anthropic_content(payload.text.strip(), payload.attachments)
-
-    with closing(get_conn()) as conn:
-        if payload.conversation_id is None:
-            title_source = payload.text.strip() or (
-                payload.attachments[0].name if payload.attachments else "新对话"
-            )
-            title = title_source[:40]
-            cursor = conn.execute(
-                "INSERT INTO conversations (user_id, provider_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                (user["id"], provider["id"], title, now, now),
-            )
-            conversation_id = cursor.lastrowid
-        else:
-            convo = conn.execute(
-                "SELECT * FROM conversations WHERE id = ? AND user_id = ?",
-                (payload.conversation_id, user["id"]),
-            ).fetchone()
-            if not convo:
-                raise HTTPException(status_code=404, detail="会话不存在")
-            conversation_id = convo["id"]
-            conn.execute(
-                "UPDATE conversations SET provider_id = ?, updated_at = ? WHERE id = ?",
-                (provider["id"], now, conversation_id),
-            )
-
-        conn.execute(
-            "INSERT INTO messages (conversation_id, role, content_text, content_json, thinking_text, created_at) VALUES (?, 'user', ?, ?, '', ?)",
-            (
-                conversation_id,
-                payload.text.strip() if isinstance(content, str) else None,
-                json.dumps(content, ensure_ascii=False)
-                if isinstance(content, list)
-                else None,
-                now,
-            ),
-        )
-        conn.commit()
-
-    return provider, conversation_id, content
-
-
-def save_assistant_message(
-    conversation_id: int, assistant_text: str, thinking_text: str
-) -> dict[str, Any]:
-    assistant_created_at = utcnow()
-    with closing(get_conn()) as conn:
-        conn.execute(
-            "INSERT INTO messages (conversation_id, role, content_text, content_json, thinking_text, created_at) VALUES (?, 'assistant', ?, NULL, ?, ?)",
-            (conversation_id, assistant_text, thinking_text, assistant_created_at),
-        )
-        conn.execute(
-            "UPDATE conversations SET updated_at = ? WHERE id = ?",
-            (assistant_created_at, conversation_id),
-        )
-        conn.commit()
-        convo = conn.execute(
-            "SELECT conversations.*, providers.name AS provider_name, providers.model_name AS model_name FROM conversations JOIN providers ON providers.id = conversations.provider_id WHERE conversations.id = ?",
-            (conversation_id,),
-        ).fetchone()
-        rows = conn.execute(
-            "SELECT * FROM messages WHERE conversation_id = ? ORDER BY id DESC LIMIT 2",
-            (conversation_id,),
-        ).fetchall()
-    return {
-        "conversation": {
-            "id": convo["id"],
-            "title": convo["title"],
-            "provider_id": convo["provider_id"],
-            "provider_name": convo["provider_name"],
-            "model_name": convo["model_name"],
-            "created_at": convo["created_at"],
-            "updated_at": convo["updated_at"],
-        },
-        "messages": [parse_message(row) for row in reversed(rows)],
-    }
-
-
-async def call_provider(
-    provider: sqlite3.Row, payload: dict[str, Any]
-) -> dict[str, Any]:
-    url = ensure_anthropic_messages_url(provider["api_url"])
-    headers = {
-        "x-api-key": provider["api_key"],
-        "anthropic-version": ANTHROPIC_VERSION,
-        "content-type": "application/json",
-    }
-    async with httpx.AsyncClient(timeout=120) as client:
-        response = await client.post(url, headers=headers, json=payload)
-    if response.status_code >= 400:
-        detail = response.text
-        raise HTTPException(status_code=502, detail=f"供应商调用失败: {detail}")
-    return response.json()
 
 
 async def stream_provider_events(provider: sqlite3.Row, payload: dict[str, Any]):
@@ -620,25 +421,19 @@ async def stream_provider_events(provider: sqlite3.Row, payload: dict[str, Any])
         await client.aclose()
 
 
-def extract_response_content(data: dict[str, Any]) -> tuple[str, str]:
-    text_parts: list[str] = []
-    thinking_parts: list[str] = []
-    for block in data.get("content", []):
-        block_type = block.get("type")
-        if block_type == "text" and block.get("text"):
-            text_parts.append(block["text"])
-        elif block_type == "thinking" and block.get("thinking"):
-            thinking_parts.append(block["thinking"])
-    text = "\n\n".join(part.strip() for part in text_parts if part.strip())
-    thinking = "\n\n".join(part.strip() for part in thinking_parts if part.strip())
-    if not text:
-        text = data.get("completion", "") or "模型没有返回可显示文本。"
-    return text, thinking
-
-
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/api/setup/status")
+def setup_status() -> dict[str, bool]:
+    return {"needs_admin_setup": not has_admin_account()}
+
+
+@app.post("/api/setup/admin")
+def setup_admin(payload: SetupAdminPayload) -> dict[str, Any]:
+    return create_initial_admin(payload.username, payload.password)
 
 
 @app.post("/api/auth/register")
@@ -660,11 +455,10 @@ def register(payload: RegisterPayload) -> dict[str, Any]:
         conn.commit()
         user_id = cursor.lastrowid
     token = create_session(user_id)
-    with closing(get_conn()) as conn:
-        user = conn.execute(
-            "SELECT id, username, role FROM users WHERE id = ?", (user_id,)
-        ).fetchone()
-    return {"token": token, "user": row_to_user(user)}
+    user = get_user_by_id(user_id)
+    if not user:
+        raise HTTPException(status_code=500, detail="用户创建后读取失败")
+    return {"token": token, "user": user}
 
 
 @app.post("/api/auth/login")
@@ -714,6 +508,11 @@ def list_public_providers(
     return [provider_public(row) for row in rows]
 
 
+@app.get("/api/search-providers")
+def list_search_providers() -> dict[str, dict[str, bool]]:
+    return public_search_provider_status()
+
+
 @app.get("/api/admin/providers")
 def list_admin_providers(
     admin: dict[str, Any] = Depends(require_admin),
@@ -721,6 +520,22 @@ def list_admin_providers(
     with closing(get_conn()) as conn:
         rows = conn.execute("SELECT * FROM providers ORDER BY id DESC").fetchall()
     return [provider_admin(row) for row in rows]
+
+
+@app.get("/api/admin/search-providers")
+def list_admin_search_providers(
+    admin: dict[str, Any] = Depends(require_admin),
+) -> dict[str, dict[str, Any]]:
+    return admin_search_provider_status()
+
+
+@app.put("/api/admin/search-providers/tavily")
+def update_tavily_search_provider(
+    payload: SearchProviderConfigPayload,
+    admin: dict[str, Any] = Depends(require_admin),
+) -> dict[str, Any]:
+    store_tavily_config(payload.api_key.strip(), payload.is_enabled)
+    return admin_search_provider_status()["tavily"]
 
 
 @app.post("/api/admin/providers")
@@ -866,12 +681,10 @@ def update_admin_settings(
     payload: RegistrationSettingsPayload,
     admin: dict[str, Any] = Depends(require_admin),
 ) -> dict[str, bool]:
-    with closing(get_conn()) as conn:
-        conn.execute(
-            "UPDATE app_settings SET value = ?, updated_at = ? WHERE key = 'allow_registration'",
-            ("1" if payload.allow_registration else "0", utcnow()),
-        )
-        conn.commit()
+    upsert_setting_value(
+        ALLOW_REGISTRATION_KEY,
+        "1" if payload.allow_registration else "0",
+    )
     return {"allow_registration": payload.allow_registration}
 
 
@@ -933,14 +746,8 @@ def update_admin_user(
             raise HTTPException(status_code=404, detail="用户不存在")
         if user["id"] == admin["id"] and not payload.is_enabled:
             raise HTTPException(status_code=400, detail="不能停用当前管理员")
-        if user["role"] == "admin" and not payload.is_enabled:
-            enabled_admins = conn.execute(
-                "SELECT COUNT(*) AS count FROM users WHERE role = 'admin' AND is_enabled = 1"
-            ).fetchone()
-            if enabled_admins["count"] <= 1:
-                raise HTTPException(
-                    status_code=400, detail="至少保留一个启用中的管理员"
-                )
+        if user["role"] == "admin" and user["is_enabled"] and not payload.is_enabled:
+            ensure_other_enabled_admin_exists(conn, user_id)
         conn.execute(
             "UPDATE users SET is_enabled = ? WHERE id = ?",
             (int(payload.is_enabled), user_id),
@@ -962,19 +769,15 @@ def delete_admin_user(
 ) -> dict[str, str]:
     with closing(get_conn()) as conn:
         user = conn.execute(
-            "SELECT id, role FROM users WHERE id = ?",
+            "SELECT id, role, is_enabled FROM users WHERE id = ?",
             (user_id,),
         ).fetchone()
         if not user:
             raise HTTPException(status_code=404, detail="用户不存在")
         if user["id"] == admin["id"]:
             raise HTTPException(status_code=400, detail="不能删除当前管理员")
-        if user["role"] == "admin":
-            admin_count = conn.execute(
-                "SELECT COUNT(*) AS count FROM users WHERE role = 'admin'"
-            ).fetchone()
-            if admin_count["count"] <= 1:
-                raise HTTPException(status_code=400, detail="至少保留一个管理员")
+        if user["role"] == "admin" and user["is_enabled"]:
+            ensure_other_enabled_admin_exists(conn, user_id)
         conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
         conn.execute(
             "DELETE FROM messages WHERE conversation_id IN (SELECT id FROM conversations WHERE user_id = ?)",
@@ -1116,43 +919,112 @@ def delete_conversation(
     return {"status": "ok"}
 
 
-@app.post("/api/chat")
-async def send_message(
-    payload: ChatPayload, user: dict[str, Any] = Depends(get_current_user)
-) -> dict[str, Any]:
-    provider, conversation_id, _ = prepare_chat_context(payload, user)
-    history = build_history(conversation_id)
-    request_payload = build_chat_request_payload(provider, history, payload)
-    response_data = await call_provider(provider, request_payload)
-    assistant_text, thinking_text = extract_response_content(response_data)
-    return save_assistant_message(conversation_id, assistant_text, thinking_text)
-
-
 @app.post("/api/chat/stream")
 async def stream_message(
     payload: ChatPayload, user: dict[str, Any] = Depends(get_current_user)
 ):
-    provider, conversation_id, _ = prepare_chat_context(payload, user)
-    history = build_history(conversation_id)
-    request_payload = build_chat_request_payload(
-        provider, history, payload, stream=True
-    )
+    try:
+        context = prepare_stream_chat(payload, user)
+    except SearchProviderUnavailableError as exc:
+        detail = exc.detail
+
+        async def unavailable_event_generator():
+            yield (
+                json.dumps({"type": "error", "detail": detail}, ensure_ascii=False)
+                + "\n"
+            )
+
+        return StreamingResponse(
+            unavailable_event_generator(),
+            media_type="application/x-ndjson",
+        )
 
     async def event_generator():
         thinking_parts: list[str] = []
         text_parts: list[str] = []
+        completed = False
+        committed = False
         try:
             initial = {
                 "type": "conversation",
                 "conversation": {
-                    "id": conversation_id,
-                    "provider_id": provider["id"],
-                    "provider_name": provider["name"],
-                    "model_name": provider["model_name"],
+                    "id": context.conversation_id,
+                    "provider_id": context.provider["id"],
+                    "provider_name": context.provider["name"],
+                    "model_name": context.provider["model_name"],
                 },
             }
             yield json.dumps(initial, ensure_ascii=False) + "\n"
-            async for line in stream_provider_events(provider, request_payload):
+            if context.search_tool:
+                activity_id = f"tool-{context.conversation_id}-1"
+                yield (
+                    json.dumps(
+                        {
+                            "type": "activity",
+                            "activity": {
+                                "id": activity_id,
+                                "kind": "tool",
+                                "label": context.search_tool["label"],
+                                "status": "running",
+                                "detail": "正在执行搜索",
+                            },
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+                try:
+                    tool_result = await asyncio.to_thread(
+                        chat_service.execute_search_tool,
+                        context.search_tool["name"],
+                        context.search_query_text,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    detail = (
+                        exc.detail
+                        if isinstance(exc, HTTPException)
+                        else str(exc) or "搜索工具执行失败"
+                    )
+                    yield (
+                        json.dumps(
+                            {
+                                "type": "activity",
+                                "activity": {
+                                    "id": activity_id,
+                                    "kind": "tool",
+                                    "label": context.search_tool["label"],
+                                    "status": "error",
+                                    "detail": detail,
+                                },
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+                    raise
+                chat_service.inject_search_result_into_request_payload(
+                    context.request_payload, tool_result
+                )
+                yield (
+                    json.dumps(
+                        {
+                            "type": "activity",
+                            "activity": {
+                                "id": activity_id,
+                                "kind": "tool",
+                                "label": tool_result["label"],
+                                "status": "done",
+                                "detail": tool_result.get("detail"),
+                                "output": tool_result.get("output"),
+                            },
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+            async for line in stream_provider_events(
+                context.provider, context.request_payload
+            ):
                 if not line or line.startswith(":"):
                     continue
                 if line.startswith("event:"):
@@ -1161,9 +1033,30 @@ async def stream_message(
                     continue
                 raw = line.removeprefix("data:").strip()
                 if raw == "[DONE]":
+                    completed = True
                     break
                 data = json.loads(raw)
                 event_type = data.get("type")
+
+                if event_type in {"message_stop", "response.completed"}:
+                    completed = True
+                    break
+
+                if event_type in {"error", "response.error"}:
+                    error_payload = data.get("error")
+                    detail = (
+                        error_payload.get("message")
+                        if isinstance(error_payload, dict)
+                        else None
+                    )
+                    detail = (
+                        detail
+                        or data.get("detail")
+                        or (error_payload if isinstance(error_payload, str) else None)
+                        or "供应商流返回错误事件"
+                    )
+                    raise RuntimeError(detail)
+
                 if event_type == "content_block_delta":
                     delta = data.get("delta", {})
                     text = delta.get("text")
@@ -1195,18 +1088,27 @@ async def stream_message(
                             )
                             + "\n"
                         )
-            assistant_text = "".join(text_parts).strip() or "模型没有返回可显示文本。"
-            thinking_text = "".join(thinking_parts).strip()
-            result = save_assistant_message(
-                conversation_id, assistant_text, thinking_text
+            if not completed:
+                raise RuntimeError("流式响应未正确完成")
+            result = commit_stream_chat(
+                context, "".join(text_parts), "".join(thinking_parts)
             )
+            committed = True
             yield json.dumps({"type": "done", **result}, ensure_ascii=False) + "\n"
+        except asyncio.CancelledError:
+            if not committed:
+                rollback_stream_chat(context)
+            raise
         except HTTPException as exc:
+            if not committed:
+                rollback_stream_chat(context)
             yield (
                 json.dumps({"type": "error", "detail": exc.detail}, ensure_ascii=False)
                 + "\n"
             )
         except Exception as exc:  # noqa: BLE001
+            if not committed:
+                rollback_stream_chat(context)
             yield (
                 json.dumps({"type": "error", "detail": str(exc)}, ensure_ascii=False)
                 + "\n"

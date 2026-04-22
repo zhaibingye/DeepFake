@@ -1,0 +1,918 @@
+import asyncio
+import json
+import tempfile
+import unittest
+from contextlib import closing
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+from fastapi.testclient import TestClient
+
+from app import chat_service, db, main
+from app.auth import hash_password, utcnow
+
+
+class ChatRouteShapeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.client = TestClient(main.app)
+
+    def tearDown(self) -> None:
+        self.client.close()
+
+    def test_post_chat_route_is_removed(self) -> None:
+        response = self.client.post("/api/chat", json={})
+
+        self.assertEqual(response.status_code, 404)
+
+
+class ChatStreamCommitTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.original_data_dir = db.DATA_DIR
+        self.original_db_path = db.DB_PATH
+        self.addCleanup(setattr, db, "DATA_DIR", self.original_data_dir)
+        self.addCleanup(setattr, db, "DB_PATH", self.original_db_path)
+
+        db.ensure_data_dir()
+        self.test_file = tempfile.NamedTemporaryFile(
+            dir=self.original_data_dir, suffix=".db", delete=False
+        )
+        self.test_file.close()
+        self.test_db_path = Path(self.test_file.name)
+        db.DATA_DIR = self.test_db_path.parent
+        db.DB_PATH = self.test_db_path
+        self.addCleanup(self.cleanup_test_db)
+
+        main.ensure_tables()
+        self.user = self.create_user("stream-user")
+        main.app.dependency_overrides[main.get_current_user] = self.fake_user
+        self.addCleanup(main.app.dependency_overrides.clear)
+
+        self.client = TestClient(main.app)
+        self.addCleanup(self.client.close)
+
+    def cleanup_test_db(self) -> None:
+        if self.test_db_path.exists():
+            self.test_db_path.unlink()
+
+    def fake_user(self) -> dict[str, object]:
+        return self.user
+
+    def create_user(self, username: str) -> dict[str, object]:
+        salt, password_hash = hash_password("secret123")
+        with closing(db.get_conn()) as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO users (
+                    username, password_salt, password_hash, role, is_enabled, created_at
+                ) VALUES (?, ?, ?, 'user', 1, ?)
+                """,
+                (username, salt, password_hash, utcnow()),
+            )
+            conn.commit()
+            user_id = int(cursor.lastrowid)
+        return {
+            "id": user_id,
+            "username": username,
+            "role": "user",
+            "is_enabled": True,
+        }
+
+    def create_provider(self, supports_vision: bool = False) -> int:
+        now = utcnow()
+        with closing(db.get_conn()) as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO providers (
+                    name, api_url, api_key, model_name, supports_thinking, supports_vision,
+                    thinking_effort, max_context_window, max_output_tokens, is_enabled, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 1, ?, 'high', 256000, 32000, 1, ?, ?)
+                """,
+                (
+                    "Test Provider",
+                    "https://example.invalid/messages",
+                    "secret",
+                    "test-model",
+                    int(supports_vision),
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+            return int(cursor.lastrowid)
+
+    def create_conversation_with_message(self, provider_id: int) -> int:
+        now = utcnow()
+        with closing(db.get_conn()) as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO conversations (
+                    user_id, provider_id, title, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (self.user["id"], provider_id, "已有会话", now, now),
+            )
+            conversation_id = int(cursor.lastrowid)
+            conn.execute(
+                """
+                INSERT INTO messages (
+                    conversation_id, role, content_text, content_json, thinking_text, created_at
+                ) VALUES (?, 'user', ?, NULL, '', ?)
+                """,
+                (conversation_id, "旧消息", now),
+            )
+            conn.commit()
+        return conversation_id
+
+    def parse_stream_events(self, response) -> list[dict[str, object]]:
+        lines = [line for line in response.text.splitlines() if line.strip()]
+        return [json.loads(line) for line in lines]
+
+    async def collect_stream_chunks(self, response) -> list[str]:
+        chunks: list[str] = []
+        async for chunk in response.body_iterator:
+            chunks.append(chunk.decode() if isinstance(chunk, bytes) else chunk)
+        return chunks
+
+    def fetch_messages(self) -> list[dict[str, object]]:
+        with closing(db.get_conn()) as conn:
+            rows = conn.execute(
+                """
+                SELECT role, content_text, content_json, thinking_text
+                FROM messages
+                ORDER BY id
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def count_conversations(self) -> int:
+        with closing(db.get_conn()) as conn:
+            row = conn.execute("SELECT COUNT(*) AS count FROM conversations").fetchone()
+        return int(row["count"])
+
+    def test_stream_completion_persists_user_and_assistant_messages(self) -> None:
+        provider_id = self.create_provider()
+
+        async def fake_stream_provider_events(provider, payload):
+            self.assertEqual(payload["messages"][-1]["role"], "user")
+            self.assertEqual(payload["messages"][-1]["content"], "你好")
+            yield 'data: {"type":"content_block_delta","delta":{"text":"世界"}}'
+            yield 'data: {"type":"content_block_delta","delta":{"thinking":"思考中"}}'
+            yield 'data: {"type":"message_delta","usage":{"output_tokens":3}}'
+            yield "data: [DONE]"
+
+        with patch("app.main.stream_provider_events", fake_stream_provider_events):
+            response = self.client.post(
+                "/api/chat/stream",
+                json={"provider_id": provider_id, "text": "你好", "attachments": []},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        events = self.parse_stream_events(response)
+        self.assertEqual(events[0]["type"], "conversation")
+        self.assertEqual(events[-1]["type"], "done")
+
+        messages = self.fetch_messages()
+        self.assertEqual(self.count_conversations(), 1)
+        self.assertEqual(
+            messages,
+            [
+                {
+                    "role": "user",
+                    "content_text": "你好",
+                    "content_json": None,
+                    "thinking_text": "",
+                },
+                {
+                    "role": "assistant",
+                    "content_text": "世界",
+                    "content_json": None,
+                    "thinking_text": "思考中",
+                },
+            ],
+        )
+
+    def test_stream_provider_error_does_not_persist_partial_round(self) -> None:
+        provider_id = self.create_provider()
+
+        async def fake_stream_provider_events(provider, payload):
+            yield 'data: {"type":"content_block_delta","delta":{"text":"半截"}}'
+            raise RuntimeError("provider boom")
+
+        with patch("app.main.stream_provider_events", fake_stream_provider_events):
+            response = self.client.post(
+                "/api/chat/stream",
+                json={"provider_id": provider_id, "text": "这轮不能保存", "attachments": []},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        events = self.parse_stream_events(response)
+        self.assertEqual(events[0]["type"], "conversation")
+        self.assertEqual(events[-1]["type"], "error")
+        self.assertEqual(self.fetch_messages(), [])
+        self.assertEqual(self.count_conversations(), 0)
+
+    def test_existing_conversation_keeps_original_messages_on_stream_error(self) -> None:
+        provider_id = self.create_provider()
+        conversation_id = self.create_conversation_with_message(provider_id)
+        original_messages = self.fetch_messages()
+
+        async def fake_stream_provider_events(provider, payload):
+            self.assertEqual(payload["messages"][0]["content"], "旧消息")
+            self.assertEqual(payload["messages"][-1]["content"], "这轮失败后不能写入")
+            yield 'data: {"type":"content_block_delta","delta":{"text":"半截"}}'
+            raise RuntimeError("provider boom")
+
+        with patch("app.main.stream_provider_events", fake_stream_provider_events):
+            response = self.client.post(
+                "/api/chat/stream",
+                json={
+                    "provider_id": provider_id,
+                    "conversation_id": conversation_id,
+                    "text": "这轮失败后不能写入",
+                    "attachments": [],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        events = self.parse_stream_events(response)
+        self.assertEqual(events[0]["type"], "conversation")
+        self.assertEqual(events[-1]["type"], "error")
+        self.assertEqual(self.fetch_messages(), original_messages)
+        self.assertEqual(self.count_conversations(), 1)
+
+    def test_stream_without_done_marker_does_not_persist_partial_round(self) -> None:
+        provider_id = self.create_provider()
+
+        async def fake_stream_provider_events(provider, payload):
+            yield 'data: {"type":"content_block_delta","delta":{"text":"未完成"}}'
+
+        with patch("app.main.stream_provider_events", fake_stream_provider_events):
+            response = self.client.post(
+                "/api/chat/stream",
+                json={"provider_id": provider_id, "text": "不要提交", "attachments": []},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        events = self.parse_stream_events(response)
+        self.assertEqual(events[0]["type"], "conversation")
+        self.assertEqual(events[-1]["type"], "error")
+        self.assertEqual(self.fetch_messages(), [])
+        self.assertEqual(self.count_conversations(), 0)
+
+    def test_stream_natural_completion_without_done_still_commits(self) -> None:
+        provider_id = self.create_provider()
+
+        async def fake_stream_provider_events(provider, payload):
+            yield 'data: {"type":"content_block_delta","delta":{"thinking":"先想一下"}}'
+            yield 'data: {"type":"content_block_delta","delta":{"text":"正常结束"}}'
+            yield 'data: {"type":"message_stop"}'
+
+        with patch("app.main.stream_provider_events", fake_stream_provider_events):
+            response = self.client.post(
+                "/api/chat/stream",
+                json={"provider_id": provider_id, "text": "测试自然结束", "attachments": []},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        events = self.parse_stream_events(response)
+        self.assertEqual(events[-1]["type"], "done")
+        self.assertEqual(
+            self.fetch_messages(),
+            [
+                {
+                    "role": "user",
+                    "content_text": "测试自然结束",
+                    "content_json": None,
+                    "thinking_text": "",
+                },
+                {
+                    "role": "assistant",
+                    "content_text": "正常结束",
+                    "content_json": None,
+                    "thinking_text": "先想一下",
+                },
+            ],
+        )
+
+    def test_stream_response_completed_still_commits(self) -> None:
+        provider_id = self.create_provider()
+
+        async def fake_stream_provider_events(provider, payload):
+            yield 'data: {"type":"content_block_delta","delta":{"text":"完成事件也提交"}}'
+            yield 'data: {"type":"response.completed"}'
+
+        with patch("app.main.stream_provider_events", fake_stream_provider_events):
+            response = self.client.post(
+                "/api/chat/stream",
+                json={"provider_id": provider_id, "text": "测试 response.completed", "attachments": []},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        events = self.parse_stream_events(response)
+        self.assertEqual(events[-1]["type"], "done")
+        self.assertEqual(
+            self.fetch_messages(),
+            [
+                {
+                    "role": "user",
+                    "content_text": "测试 response.completed",
+                    "content_json": None,
+                    "thinking_text": "",
+                },
+                {
+                    "role": "assistant",
+                    "content_text": "完成事件也提交",
+                    "content_json": None,
+                    "thinking_text": "",
+                },
+            ],
+        )
+
+    def test_stream_error_event_returns_error_and_rolls_back(self) -> None:
+        provider_id = self.create_provider()
+
+        async def fake_stream_provider_events(provider, payload):
+            yield 'data: {"type":"content_block_delta","delta":{"text":"半截"}}'
+            yield 'data: {"type":"error","error":{"message":"provider event boom"}}'
+
+        with patch("app.main.stream_provider_events", fake_stream_provider_events):
+            response = self.client.post(
+                "/api/chat/stream",
+                json={"provider_id": provider_id, "text": "错误事件不提交", "attachments": []},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        events = self.parse_stream_events(response)
+        self.assertEqual(events[0]["type"], "conversation")
+        self.assertEqual(events[-1], {"type": "error", "detail": "provider event boom"})
+        self.assertEqual(self.fetch_messages(), [])
+        self.assertEqual(self.count_conversations(), 0)
+
+    def test_stream_response_error_event_uses_stable_detail_and_rolls_back(self) -> None:
+        provider_id = self.create_provider()
+
+        async def fake_stream_provider_events(provider, payload):
+            yield 'data: {"type":"content_block_delta","delta":{"text":"半截"}}'
+            yield 'data: {"type":"response.error","error":"bad shape","detail":"response event boom"}'
+
+        with patch("app.main.stream_provider_events", fake_stream_provider_events):
+            response = self.client.post(
+                "/api/chat/stream",
+                json={"provider_id": provider_id, "text": "response.error 不提交", "attachments": []},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        events = self.parse_stream_events(response)
+        self.assertEqual(events[0]["type"], "conversation")
+        self.assertEqual(events[-1], {"type": "error", "detail": "response event boom"})
+        self.assertEqual(self.fetch_messages(), [])
+        self.assertEqual(self.count_conversations(), 0)
+
+    def test_tavily_search_without_configured_key_fails_and_rolls_back(self) -> None:
+        provider_id = self.create_provider()
+
+        response = self.client.post(
+            "/api/chat/stream",
+            json={
+                "provider_id": provider_id,
+                "text": "测试 tavily",
+                "enable_search": True,
+                "search_provider": "tavily",
+                "attachments": [],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        events = self.parse_stream_events(response)
+        self.assertEqual(events[-1]["type"], "error")
+        self.assertIn("Tavily", events[-1]["detail"])
+        self.assertEqual(self.fetch_messages(), [])
+        self.assertEqual(self.count_conversations(), 0)
+
+    def test_exa_search_does_not_send_incomplete_tools_to_provider_payload(self) -> None:
+        provider_id = self.create_provider()
+
+        async def fake_stream_provider_events(provider, payload):
+            self.assertNotIn("tools", payload)
+            yield 'data: {"type":"content_block_delta","delta":{"text":"已使用 Exa"}}'
+            yield "data: [DONE]"
+
+        with patch("app.chat_service.run_exa_search") as run_exa_search:
+            run_exa_search.return_value = {
+                "label": "Exa 搜索",
+                "detail": "搜索已完成",
+                "output": "- result 1",
+            }
+            with patch("app.main.stream_provider_events", fake_stream_provider_events):
+                response = self.client.post(
+                    "/api/chat/stream",
+                    json={
+                        "provider_id": provider_id,
+                        "text": "请搜索",
+                        "enable_search": True,
+                        "search_provider": "exa",
+                        "attachments": [],
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        run_exa_search.assert_called_once_with("请搜索")
+        events = self.parse_stream_events(response)
+        self.assertEqual(events[-1]["type"], "done")
+        self.assertEqual(self.count_conversations(), 1)
+
+    def test_search_with_only_image_and_empty_text_returns_http_400(self) -> None:
+        provider_id = self.create_provider(supports_vision=True)
+
+        response = self.client.post(
+            "/api/chat/stream",
+            json={
+                "provider_id": provider_id,
+                "text": "   ",
+                "enable_search": True,
+                "search_provider": "exa",
+                "attachments": [
+                    {
+                        "name": "image.png",
+                        "media_type": "image/png",
+                        "data": "aGVsbG8=",
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["detail"], "搜索关键词不能为空")
+        self.assertEqual(self.fetch_messages(), [])
+        self.assertEqual(self.count_conversations(), 0)
+
+    def test_execute_search_tool_dispatches_to_exa_runner(self) -> None:
+        with patch("app.chat_service.run_exa_search") as run_exa_search:
+            run_exa_search.return_value = {
+                "label": "Exa 搜索",
+                "detail": "找到 2 条结果",
+                "output": "- result 1\n- result 2",
+            }
+
+            result = chat_service.execute_search_tool("exa_search", "查一下")
+
+        run_exa_search.assert_called_once_with("查一下")
+        self.assertEqual(
+            result,
+            {
+                "label": "Exa 搜索",
+                "detail": "找到 2 条结果",
+                "output": "- result 1\n- result 2",
+            },
+        )
+
+    def test_execute_search_tool_dispatches_to_tavily_runner(self) -> None:
+        with patch("app.chat_service.run_tavily_search") as run_tavily_search:
+            run_tavily_search.return_value = {
+                "label": "Tavily 搜索",
+                "detail": "找到 1 条结果",
+                "output": "- tavily result",
+            }
+
+            result = chat_service.execute_search_tool("tavily_search", "查 tavily")
+
+        run_tavily_search.assert_called_once_with("查 tavily")
+        self.assertEqual(
+            result,
+            {
+                "label": "Tavily 搜索",
+                "detail": "找到 1 条结果",
+                "output": "- tavily result",
+            },
+        )
+
+    def test_post_mcp_jsonrpc_posts_http_jsonrpc_request(self) -> None:
+        response = MagicMock()
+        response.status_code = 200
+        response.headers = {"Content-Type": "application/json"}
+        response.text = '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}'
+        response.json.return_value = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"ok": True},
+        }
+
+        client = MagicMock()
+        client.post.return_value = response
+
+        httpx_client = MagicMock()
+        httpx_client.return_value.__enter__.return_value = client
+
+        with patch("app.chat_service.httpx.Client", httpx_client):
+            body, headers = chat_service._post_mcp_jsonrpc(
+                "https://example.invalid/mcp",
+                {"jsonrpc": "2.0", "id": 1, "method": "initialize"},
+                {"Mcp-Method": "initialize"},
+            )
+
+        client.post.assert_called_once_with(
+            "https://example.invalid/mcp",
+            json={"jsonrpc": "2.0", "id": 1, "method": "initialize"},
+            headers={"Mcp-Method": "initialize"},
+        )
+        self.assertEqual(body, {"jsonrpc": "2.0", "id": 1, "result": {"ok": True}})
+        self.assertEqual(headers["Content-Type"], "application/json")
+
+    def test_extract_jsonrpc_response_from_sse_prefers_last_rpc_response_over_notification(
+        self,
+    ) -> None:
+        response_text = (
+            'data: {"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"搜索结果"}]}}\n\n'
+            'data: {"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info"}}\n\n'
+        )
+
+        result = chat_service._extract_jsonrpc_response_from_sse(response_text)
+
+        self.assertEqual(
+            result,
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {"content": [{"type": "text", "text": "搜索结果"}]},
+            },
+        )
+
+    def test_extract_jsonrpc_response_from_sse_ignores_trailing_server_request_with_id(
+        self,
+    ) -> None:
+        response_text = (
+            'data: {"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"搜索结果"}]}}\n\n'
+            'data: {"jsonrpc":"2.0","id":99,"method":"ping","params":{"value":"still not response"}}\n\n'
+        )
+
+        result = chat_service._extract_jsonrpc_response_from_sse(response_text)
+
+        self.assertEqual(
+            result,
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {"content": [{"type": "text", "text": "搜索结果"}]},
+            },
+        )
+
+    def test_call_remote_mcp_tool_initializes_notifies_then_calls_tool(self) -> None:
+        with patch("app.chat_service._post_mcp_jsonrpc") as post_mcp_jsonrpc:
+            post_mcp_jsonrpc.side_effect = [
+                (
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {"name": "exa", "version": "1.0.0"},
+                        },
+                    },
+                    {"MCP-Session-Id": "session-123"},
+                ),
+                (None, {"MCP-Session-Id": "session-123"}),
+                (
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "result": {
+                            "content": [{"type": "text", "text": "搜索结果正文"}],
+                        },
+                    },
+                    {"MCP-Session-Id": "session-123"},
+                ),
+            ]
+
+            result = chat_service.call_remote_mcp_tool(
+                "https://mcp.exa.ai/mcp",
+                "web_search_exa",
+                {"query": "查一下"},
+            )
+
+        self.assertEqual(
+            result,
+            {"content": [{"type": "text", "text": "搜索结果正文"}]},
+        )
+        self.assertEqual(post_mcp_jsonrpc.call_count, 3)
+
+        initialize_call = post_mcp_jsonrpc.call_args_list[0]
+        self.assertEqual(initialize_call.args[0], "https://mcp.exa.ai/mcp")
+        self.assertEqual(initialize_call.args[1]["method"], "initialize")
+        self.assertEqual(
+            initialize_call.args[1]["params"]["protocolVersion"], "2025-06-18"
+        )
+        self.assertEqual(
+            initialize_call.args[1]["params"]["clientInfo"]["name"],
+            "deepfake-backend",
+        )
+        self.assertEqual(initialize_call.args[2]["Mcp-Method"], "initialize")
+
+        initialized_call = post_mcp_jsonrpc.call_args_list[1]
+        self.assertEqual(initialized_call.args[1]["method"], "notifications/initialized")
+        self.assertEqual(
+            initialized_call.args[2]["MCP-Protocol-Version"], "2025-06-18"
+        )
+        self.assertEqual(initialized_call.args[2]["MCP-Session-Id"], "session-123")
+        self.assertEqual(
+            initialized_call.args[2]["Mcp-Method"], "notifications/initialized"
+        )
+
+        tools_call = post_mcp_jsonrpc.call_args_list[2]
+        self.assertEqual(tools_call.args[1]["method"], "tools/call")
+        self.assertEqual(tools_call.args[1]["params"]["name"], "web_search_exa")
+        self.assertEqual(tools_call.args[1]["params"]["arguments"], {"query": "查一下"})
+        self.assertEqual(tools_call.args[2]["Mcp-Method"], "tools/call")
+        self.assertEqual(tools_call.args[2]["Mcp-Name"], "web_search_exa")
+        self.assertEqual(tools_call.args[2]["MCP-Protocol-Version"], "2025-06-18")
+        self.assertEqual(tools_call.args[2]["MCP-Session-Id"], "session-123")
+
+    def test_run_exa_search_calls_exa_remote_mcp_tool(self) -> None:
+        with patch("app.chat_service.call_remote_mcp_tool") as call_remote_mcp_tool:
+            call_remote_mcp_tool.return_value = {
+                "content": [
+                    {"type": "text", "text": "结果 1"},
+                    {"type": "text", "text": "结果 2"},
+                ]
+            }
+
+            result = chat_service.run_exa_search("查一下")
+
+        call_remote_mcp_tool.assert_called_once_with(
+            "https://mcp.exa.ai/mcp",
+            "web_search_exa",
+            {"query": "查一下"},
+        )
+        self.assertEqual(
+            result,
+            {
+                "label": "Exa 搜索",
+                "detail": "返回 2 个内容块",
+                "output": "结果 1\n\n结果 2",
+            },
+        )
+
+    def test_run_tavily_search_calls_tavily_remote_mcp_tool(self) -> None:
+        with patch(
+            "app.main.get_tavily_config",
+            return_value={
+                "api_key": "tvly-secret",
+                "is_enabled": True,
+                "is_configured": True,
+            },
+        ):
+            with patch("app.chat_service.call_remote_mcp_tool") as call_remote_mcp_tool:
+                call_remote_mcp_tool.return_value = {
+                    "content": [{"type": "text", "text": "Tavily 结果"}]
+                }
+
+                result = chat_service.run_tavily_search("查 tavily")
+
+        call_remote_mcp_tool.assert_called_once_with(
+            "https://mcp.tavily.com/mcp/?tavilyApiKey=tvly-secret",
+            "tavily-search",
+            {"query": "查 tavily"},
+        )
+        self.assertEqual(
+            result,
+            {
+                "label": "Tavily 搜索",
+                "detail": "返回 1 个内容块",
+                "output": "Tavily 结果",
+            },
+        )
+
+    def test_search_tool_result_is_injected_into_provider_messages(self) -> None:
+        provider_id = self.create_provider()
+
+        async def fake_stream_provider_events(provider, payload):
+            self.assertEqual(payload["messages"][-1]["role"], "user")
+            self.assertIn("联网搜索结果", payload["messages"][-1]["content"])
+            self.assertIn("- result 1", payload["messages"][-1]["content"])
+            self.assertEqual(payload["messages"][-2]["content"], "查一下")
+            yield 'data: {"type":"content_block_delta","delta":{"text":"搜索后回答"}}'
+            yield 'data: {"type":"message_stop"}'
+
+        with patch("app.chat_service.run_exa_search") as run_exa_search:
+            run_exa_search.return_value = {
+                "label": "Exa 搜索",
+                "detail": "找到 2 条结果",
+                "output": "- result 1\n- result 2",
+            }
+            with patch("app.main.stream_provider_events", fake_stream_provider_events):
+                response = self.client.post(
+                    "/api/chat/stream",
+                    json={
+                        "provider_id": provider_id,
+                        "text": "查一下",
+                        "enable_search": True,
+                        "search_provider": "exa",
+                        "attachments": [],
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        run_exa_search.assert_called_once_with("查一下")
+        events = self.parse_stream_events(response)
+        self.assertEqual(events[-1]["type"], "done")
+
+    def test_multimodal_search_uses_text_query_instead_of_empty_string(self) -> None:
+        provider_id = self.create_provider(supports_vision=True)
+
+        async def fake_stream_provider_events(provider, payload):
+            self.assertIsInstance(payload["messages"][-2]["content"], list)
+            self.assertIn("多模态搜索结果", payload["messages"][-1]["content"])
+            yield 'data: {"type":"content_block_delta","delta":{"text":"回答"}}'
+            yield 'data: {"type":"message_stop"}'
+
+        with patch("app.chat_service.run_exa_search") as run_exa_search:
+            run_exa_search.return_value = {
+                "label": "Exa 搜索",
+                "detail": "找到结果",
+                "output": "多模态搜索结果",
+            }
+            with patch("app.main.stream_provider_events", fake_stream_provider_events):
+                response = self.client.post(
+                    "/api/chat/stream",
+                    json={
+                        "provider_id": provider_id,
+                        "text": "图里是什么，顺便搜一下",
+                        "enable_search": True,
+                        "search_provider": "exa",
+                        "attachments": [
+                            {
+                                "name": "test.png",
+                                "media_type": "image/png",
+                                "data": "aGVsbG8=",
+                            }
+                        ],
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        run_exa_search.assert_called_once_with("图里是什么，顺便搜一下")
+        events = self.parse_stream_events(response)
+        self.assertEqual(events[-1]["type"], "done")
+
+    def test_search_tool_execution_uses_asyncio_to_thread(self) -> None:
+        provider_id = self.create_provider()
+        seen: dict[str, object] = {}
+
+        async def fake_to_thread(func, *args, **kwargs):
+            seen["func"] = func
+            seen["args"] = args
+            seen["kwargs"] = kwargs
+            return {
+                "label": "Exa 搜索",
+                "detail": "找到 1 条结果",
+                "output": "- threaded result",
+            }
+
+        async def fake_stream_provider_events(provider, payload):
+            self.assertIn("- threaded result", payload["messages"][-1]["content"])
+            yield 'data: {"type":"content_block_delta","delta":{"text":"线程回答"}}'
+            yield 'data: {"type":"message_stop"}'
+
+        with patch("app.main.asyncio.to_thread", new=fake_to_thread):
+            with patch("app.main.stream_provider_events", fake_stream_provider_events):
+                response = self.client.post(
+                    "/api/chat/stream",
+                    json={
+                        "provider_id": provider_id,
+                        "text": "线程搜索",
+                        "enable_search": True,
+                        "search_provider": "exa",
+                        "attachments": [],
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIs(seen["func"], chat_service.execute_search_tool)
+        self.assertEqual(seen["args"], ("exa_search", "线程搜索"))
+        self.assertEqual(seen["kwargs"], {})
+        events = self.parse_stream_events(response)
+        self.assertEqual(events[-1]["type"], "done")
+
+    def test_search_tool_emits_activity_events_before_final_answer(self) -> None:
+        provider_id = self.create_provider()
+
+        with patch("app.chat_service.run_exa_search") as run_exa_search:
+            run_exa_search.return_value = {
+                "label": "Exa 搜索",
+                "detail": "找到 2 条结果",
+                "output": "- result 1\n- result 2",
+            }
+
+            async def fake_stream_provider_events(provider, payload):
+                yield 'data: {"type":"content_block_delta","delta":{"text":"搜索后回答"}}'
+                yield 'data: {"type":"message_stop"}'
+
+            with patch("app.main.stream_provider_events", fake_stream_provider_events):
+                response = self.client.post(
+                    "/api/chat/stream",
+                    json={
+                        "provider_id": provider_id,
+                        "text": "查一下",
+                        "enable_search": True,
+                        "search_provider": "exa",
+                        "attachments": [],
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        run_exa_search.assert_called_once_with("查一下")
+        events = self.parse_stream_events(response)
+        self.assertEqual(events[0]["type"], "conversation")
+        self.assertEqual(events[1]["type"], "activity")
+        self.assertEqual(events[1]["activity"]["status"], "running")
+        self.assertEqual(events[2]["type"], "activity")
+        self.assertEqual(events[2]["activity"]["status"], "done")
+        self.assertEqual(events[2]["activity"]["detail"], "找到 2 条结果")
+        self.assertEqual(events[2]["activity"]["output"], "- result 1\n- result 2")
+        self.assertEqual(events[-1]["type"], "done")
+        self.assertEqual(self.count_conversations(), 1)
+
+    def test_search_tool_failure_emits_activity_error_then_round_error_and_rolls_back(
+        self,
+    ) -> None:
+        provider_id = self.create_provider()
+
+        with patch("app.chat_service.run_exa_search") as run_exa_search:
+            run_exa_search.side_effect = RuntimeError("search tool boom")
+
+            async def fake_stream_provider_events(provider, payload):
+                yield 'data: {"type":"content_block_delta","delta":{"text":"不该执行到这里"}}'
+                yield 'data: {"type":"message_stop"}'
+
+            with patch("app.main.stream_provider_events", fake_stream_provider_events):
+                response = self.client.post(
+                    "/api/chat/stream",
+                    json={
+                        "provider_id": provider_id,
+                        "text": "查失败",
+                        "enable_search": True,
+                        "search_provider": "exa",
+                        "attachments": [],
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        run_exa_search.assert_called_once_with("查失败")
+        events = self.parse_stream_events(response)
+        self.assertEqual(events[0]["type"], "conversation")
+        self.assertEqual(events[1]["type"], "activity")
+        self.assertEqual(events[1]["activity"]["status"], "running")
+        self.assertEqual(events[2]["type"], "activity")
+        self.assertEqual(events[2]["activity"]["status"], "error")
+        self.assertEqual(events[2]["activity"]["detail"], "search tool boom")
+        self.assertEqual(events[-1], {"type": "error", "detail": "search tool boom"})
+        self.assertEqual(self.fetch_messages(), [])
+        self.assertEqual(self.count_conversations(), 0)
+
+    def test_empty_message_keeps_original_http_400(self) -> None:
+        provider_id = self.create_provider()
+
+        response = self.client.post(
+            "/api/chat/stream",
+            json={"provider_id": provider_id, "text": "   ", "attachments": []},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["detail"], "消息内容不能为空")
+        self.assertEqual(self.fetch_messages(), [])
+        self.assertEqual(self.count_conversations(), 0)
+
+    def test_missing_provider_keeps_original_http_404(self) -> None:
+        response = self.client.post(
+            "/api/chat/stream",
+            json={"provider_id": 999999, "text": "provider missing", "attachments": []},
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["detail"], "供应商不存在")
+        self.assertEqual(self.fetch_messages(), [])
+        self.assertEqual(self.count_conversations(), 0)
+
+    def test_cancelled_stream_rolls_back_new_conversation(self) -> None:
+        provider_id = self.create_provider()
+
+        async def fake_stream_provider_events(provider, payload):
+            yield 'data: {"type":"content_block_delta","delta":{"text":"取消前输出"}}'
+            raise asyncio.CancelledError()
+
+        with patch("app.main.stream_provider_events", fake_stream_provider_events):
+            response = asyncio.run(
+                main.stream_message(
+                    main.ChatPayload(
+                        provider_id=provider_id,
+                        text="取消这轮",
+                        attachments=[],
+                    ),
+                    self.user,
+                )
+            )
+            with self.assertRaises(asyncio.CancelledError):
+                asyncio.run(self.collect_stream_chunks(response))
+
+        self.assertEqual(self.fetch_messages(), [])
+        self.assertEqual(self.count_conversations(), 0)
