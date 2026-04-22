@@ -10,6 +10,7 @@ Thumbs.db
 *.tmp
 *.temp
 .worktrees/
+.superpowers/
 
 # Python
 __pycache__/
