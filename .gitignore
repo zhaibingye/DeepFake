@@ -9,6 +9,7 @@ Thumbs.db
 *.err
 *.tmp
 *.temp
+.worktrees/
 
 # Python
 __pycache__/
