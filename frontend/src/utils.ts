@@ -1,4 +1,6 @@
-import type { Attachment } from './types'
+import type { Attachment, TimelinePart } from './types'
+
+type MessageContent = string | Array<Record<string, unknown>> | { parts: TimelinePart[] }
 
 export function formatDateTime(value: string) {
   return new Date(value).toLocaleString('zh-CN', {
@@ -9,9 +11,15 @@ export function formatDateTime(value: string) {
   })
 }
 
-export function messagePlainText(content: string | Array<Record<string, unknown>>) {
+export function messagePlainText(content: MessageContent) {
   if (typeof content === 'string') {
     return content
+  }
+  if (!Array.isArray(content)) {
+    return content.parts
+      .filter((part) => part.kind === 'answer' && typeof part.text === 'string')
+      .map((part) => part.text ?? '')
+      .join('\n\n')
   }
   return content
     .filter((item) => item.type === 'text' && typeof item.text === 'string')
@@ -19,8 +27,11 @@ export function messagePlainText(content: string | Array<Record<string, unknown>
     .join('\n\n')
 }
 
-export function messageImages(content: string | Array<Record<string, unknown>>) {
+export function messageImages(content: MessageContent) {
   if (typeof content === 'string') {
+    return []
+  }
+  if (!Array.isArray(content)) {
     return []
   }
 

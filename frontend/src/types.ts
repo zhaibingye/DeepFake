@@ -65,10 +65,27 @@ export type ChatRequest = {
   attachments: Attachment[]
 }
 
+export type TimelinePartKind = 'thinking' | 'tool' | 'answer'
+
+export type TimelinePartStatus = 'running' | 'done' | 'error'
+
+export type TimelinePart = {
+  id: string
+  kind: TimelinePartKind
+  status: TimelinePartStatus
+  text?: string
+  label?: string
+  detail?: string
+  output?: string
+  tool_name?: string
+  input?: string
+}
+
 export type Message = {
   id: number
   role: 'user' | 'assistant'
-  content: string | Array<Record<string, unknown>>
+  content: string | Array<Record<string, unknown>> | { parts: TimelinePart[] }
+  parts?: TimelinePart[]
   thinking_text: string
   created_at: string
 }
@@ -100,6 +117,10 @@ export type ChatDonePayload = {
 
 export type ChatStreamEvent =
   | { type: 'conversation'; conversation: Partial<Conversation> & Pick<Conversation, 'id' | 'provider_id'> }
+  | { type: 'timeline_part_start'; part: TimelinePart }
+  | { type: 'timeline_part_delta'; part_id: string; delta: Partial<TimelinePart> }
+  | { type: 'timeline_part_end'; part_id: string }
+  | { type: 'timeline_part_error'; part_id: string; detail: string }
   | { type: 'text_delta'; delta: string }
   | { type: 'thinking_delta'; delta: string }
   | { type: 'activity'; activity: StreamActivity }

@@ -77,6 +77,34 @@ async function parseNdjsonStream<T>(response: Response, onChunk: (chunk: T) => v
   }
 }
 
+function normalizeMessage(message: Message): Message {
+  if (Array.isArray(message.parts) && message.parts.length > 0) {
+    return message
+  }
+
+  if (
+    typeof message.content === 'object' &&
+    message.content !== null &&
+    !Array.isArray(message.content) &&
+    Array.isArray(message.content.parts)
+  ) {
+    return { ...message, parts: message.content.parts }
+  }
+
+  return message
+}
+
+function normalizeChatStreamEvent(event: ChatStreamEvent): ChatStreamEvent {
+  if (event.type !== 'done') {
+    return event
+  }
+
+  return {
+    ...event,
+    messages: event.messages.map(normalizeMessage),
+  }
+}
+
 export const api = {
   health: () => request<{ status: string }>('/health'),
   setupStatus: () => request<SetupStatus>('/setup/status'),
@@ -188,6 +216,6 @@ export const api = {
       throw new Error(detail)
     }
 
-    await parseNdjsonStream<ChatStreamEvent>(response, onChunk)
+    await parseNdjsonStream<ChatStreamEvent>(response, (chunk) => onChunk(normalizeChatStreamEvent(chunk)))
   },
 }
