@@ -20,6 +20,8 @@ import {
   UserRound,
 } from 'lucide-react'
 import { api } from './api'
+import { constrainProviderState, normalizeThinkingEffort, resolveAuthMode } from './appState'
+import type { AuthMode } from './appState'
 import { MarkdownView } from './components/MarkdownView'
 import { TimelineList } from './components/chat/TimelineList'
 import { toRenderableTimeline } from './components/chat/timeline'
@@ -43,7 +45,6 @@ import type {
 } from './types'
 import { fileToAttachment, formatDateTime, messageImages, messagePlainText } from './utils'
 
-type AuthMode = 'login' | 'register'
 type AppRoute = 'chat' | 'admin'
 type AdminSection = 'overview' | 'providers' | 'users'
 type SearchProviderLoadState = 'loading' | 'ready' | 'error'
@@ -73,11 +74,6 @@ const defaultProviderForm = {
 
 const thinkingEffortOptions: ThinkingEffort[] = ['low', 'medium', 'high', 'max']
 const searchProviderOptions: SearchProviderKind[] = ['exa', 'tavily']
-
-function normalizeThinkingEffort(effort: string): ThinkingEffort {
-  if (thinkingEffortOptions.includes(effort as ThinkingEffort)) return effort as ThinkingEffort
-  return 'high'
-}
 
 function searchProviderLabel(kind: SearchProviderKind) {
   return kind === 'exa' ? 'Exa' : 'Tavily'
@@ -181,6 +177,15 @@ function App() {
   const shouldFollowStreamRef = useRef(true)
   const streamAbortRef = useRef<AbortController | null>(null)
   const authSessionVersionRef = useRef(0)
+  const routeRef = useRef<AppRoute>(route)
+  const providersRef = useRef<Provider[]>(providers)
+  const selectedProviderIdRef = useRef<number | null>(selectedProviderId)
+  const composerStateRef = useRef({
+    effort,
+    enableThinking,
+    enableSearch,
+    attachments,
+  })
 
   const selectedProvider = providers.find((provider) => provider.id === selectedProviderId) ?? null
   const currentConversation =
@@ -191,6 +196,8 @@ function App() {
   const selectedSearchProviderStatus = searchProviders?.[searchProvider] ?? null
   const isAdminRoute = route === 'admin'
   const hasVisibleConversation = messages.length > 0 || !!pendingUserMessage || streamingTimeline.parts.length > 0
+  const hasStreamingTimelineParts = streamingTimeline.parts.length > 0
+  const effectiveAuthMode = resolveAuthMode(authMode, publicAuthSettings.allow_registration)
   const providerApiUrlPlaceholder = 'https://.../anthropic/v1'
   const filteredAdminUsers = adminUsers.filter((managedUser) => {
     const keyword = userSearch.trim().toLowerCase()
@@ -281,12 +288,58 @@ function App() {
     }, 0)
   }
 
+  const applyProviderSelection = useCallback((nextProviderId: number | null, providerList = providersRef.current) => {
+    setSelectedProviderId(nextProviderId)
+    selectedProviderIdRef.current = nextProviderId
+
+    const nextProvider = providerList.find((provider) => provider.id === nextProviderId) ?? null
+    const nextState = constrainProviderState(
+      composerStateRef.current,
+      nextProvider,
+    )
+
+    if (nextState.effort !== composerStateRef.current.effort) {
+      setEffort(nextState.effort)
+    }
+    if (nextState.enableThinking !== composerStateRef.current.enableThinking) {
+      setEnableThinking(nextState.enableThinking)
+    }
+    if (nextState.enableSearch !== composerStateRef.current.enableSearch) {
+      setEnableSearch(nextState.enableSearch)
+    }
+    if (nextState.attachments !== composerStateRef.current.attachments) {
+      setAttachments(nextState.attachments)
+    }
+    composerStateRef.current = nextState
+  }, [])
+
   useEffect(() => {
     if (!shouldFollowStreamRef.current) {
       return
     }
-    messageEndRef.current?.scrollIntoView({ behavior: streamingTimeline.parts.length ? 'auto' : 'smooth' })
-  }, [messages, streamingTimeline.revision])
+    messageEndRef.current?.scrollIntoView({ behavior: hasStreamingTimelineParts ? 'auto' : 'smooth' })
+  }, [hasStreamingTimelineParts, messages, streamingTimeline.revision])
+
+  useEffect(() => {
+    routeRef.current = route
+  }, [route])
+
+  useEffect(() => {
+    providersRef.current = providers
+  }, [providers])
+
+  useEffect(() => {
+    selectedProviderIdRef.current = selectedProviderId
+  }, [selectedProviderId])
+
+  useEffect(() => {
+    composerStateRef.current = {
+      effort,
+      enableThinking,
+      enableSearch,
+      attachments,
+    }
+  }, [attachments, effort, enableSearch, enableThinking])
 
   useEffect(() => {
     const handleScroll = () => {
@@ -300,47 +353,31 @@ function App() {
 
   useEffect(() => {
     const handlePopState = () => {
-      setRoute(getRouteFromLocation())
+      const nextRoute = getRouteFromLocation()
+      if (nextRoute === 'admin' && user?.role !== 'admin') {
+        window.history.replaceState(null, '', '/')
+        setRoute('chat')
+        setAdminSection('overview')
+        return
+      }
+      setRoute(nextRoute)
       setAdminSection(getAdminSectionFromLocation())
     }
     window.addEventListener('popstate', handlePopState)
     return () => window.removeEventListener('popstate', handlePopState)
-  }, [])
-
-  useEffect(() => {
-    if (!selectedProvider) {
-      return
-    }
-    setEffort(normalizeThinkingEffort(selectedProvider.thinking_effort))
-    if (!selectedProvider.supports_thinking) {
-      setEnableThinking(false)
-    }
-    if (!selectedProvider.supports_vision) {
-      setAttachments([])
-    }
-    if (!selectedProvider.supports_tool_calling) {
-      setEnableSearch(false)
-    }
-  }, [selectedProvider])
-
-  useEffect(() => {
-    if (!publicAuthSettings.allow_registration && authMode === 'register') {
-      setAuthMode('login')
-    }
-  }, [authMode, publicAuthSettings.allow_registration])
-
-  useEffect(() => {
-    if (route === 'admin' && user?.role !== 'admin') {
-      navigateTo('chat', true)
-    }
-  }, [route, user?.role])
+  }, [user?.role])
 
   const loadProviders = useCallback(async (currentToken = token) => {
     if (!currentToken) return
     const list = await api.listProviders(currentToken)
+    providersRef.current = list
     setProviders(list)
-    setSelectedProviderId((prev) => (prev && list.some((provider) => provider.id === prev) ? prev : list[0]?.id ?? null))
-  }, [token])
+    const nextProviderId =
+      selectedProviderIdRef.current && list.some((provider) => provider.id === selectedProviderIdRef.current)
+        ? selectedProviderIdRef.current
+        : list[0]?.id ?? null
+    applyProviderSelection(nextProviderId, list)
+  }, [applyProviderSelection, token])
 
   const loadSearchProviders = useCallback(async () => {
     setSearchProviderLoadState('loading')
@@ -421,7 +458,7 @@ function App() {
           setAdminSettings({ allow_registration: true })
         }
       }
-      if (route === 'admin' && me.role !== 'admin') {
+      if (routeRef.current === 'admin' && me.role !== 'admin') {
         navigateTo('chat', true)
       }
     } catch {
@@ -437,28 +474,34 @@ function App() {
       setActiveConversation(null)
       setMessages([])
       setActiveConversationId(null)
-      setSelectedProviderId(null)
+      applyProviderSelection(null)
       setAttachments([])
       setInput('')
       resetSearchState()
       setPendingUserMessage(null)
       void refreshAuthSurface()
     }
-  }, [loadAdminData, loadConversations, loadProviders, refreshAuthSurface, route])
+  }, [applyProviderSelection, loadAdminData, loadConversations, loadProviders, refreshAuthSurface])
 
   useEffect(() => {
     void refreshAuthSurface()
   }, [refreshAuthSurface])
 
   useEffect(() => {
-    void loadSearchProviders().catch(() => undefined)
+    const timer = window.setTimeout(() => {
+      void loadSearchProviders().catch(() => undefined)
+    }, 0)
+    return () => window.clearTimeout(timer)
   }, [loadSearchProviders, token])
 
   useEffect(() => {
     if (!token) {
       return
     }
-    void bootstrap(token)
+    const timer = window.setTimeout(() => {
+      void bootstrap(token)
+    }, 0)
+    return () => window.clearTimeout(timer)
   }, [bootstrap, token])
 
   async function handleAuthSubmit(event: React.FormEvent<HTMLFormElement>) {
@@ -469,7 +512,7 @@ function App() {
       const result =
         setupStatus.needs_admin_setup
           ? await api.setupAdmin(authUsername, authPassword)
-          : authMode === 'login'
+          : effectiveAuthMode === 'login'
           ? await api.login(authUsername, authPassword)
           : await api.register(authUsername, authPassword)
       localStorage.setItem('token', result.token)
@@ -505,7 +548,7 @@ function App() {
     setActiveConversation(null)
     setMessages([])
     setActiveConversationId(null)
-    setSelectedProviderId(null)
+    applyProviderSelection(null)
     setAttachments([])
     setChatLoading(false)
     streamingTimeline.reset()
@@ -522,7 +565,7 @@ function App() {
     const summary = conversations.find((item) => item.id === conversationId)
     setActiveConversationId(result.conversation.id)
     setActiveConversation({ ...summary, ...result.conversation })
-    setSelectedProviderId(result.conversation.provider_id)
+    applyProviderSelection(result.conversation.provider_id)
     setMessages(result.messages)
     streamingTimeline.reset()
     setPendingUserMessage(null)
@@ -762,7 +805,7 @@ function App() {
       await api.deleteProvider(token, provider.id)
       setProviderSuccess('供应商已删除')
       if (selectedProviderId === provider.id) {
-        setSelectedProviderId(null)
+        applyProviderSelection(null)
       }
       await Promise.all([loadProviders(token), loadAdminData(token, 'admin')])
     } catch (error) {
@@ -932,8 +975,8 @@ function App() {
                   <div className="hint-text">当前还没有管理员账号，请先初始化首个管理员。</div>
                 ) : (
                   <div className="auth-tabs">
-                    <button className={authMode === 'login' ? 'active' : ''} onClick={() => setAuthMode('login')} type="button">登录</button>
-                    <button className={authMode === 'register' ? 'active' : ''} disabled={!publicAuthSettings.allow_registration} onClick={() => setAuthMode('register')} type="button">注册</button>
+                    <button className={effectiveAuthMode === 'login' ? 'active' : ''} onClick={() => setAuthMode('login')} type="button">登录</button>
+                    <button className={effectiveAuthMode === 'register' ? 'active' : ''} disabled={!publicAuthSettings.allow_registration} onClick={() => setAuthMode('register')} type="button">注册</button>
                   </div>
                 )}
                 <form className="auth-form" onSubmit={handleAuthSubmit}>
@@ -947,7 +990,7 @@ function App() {
                   </label>
                   {authError ? <div className="error-text">{authError}</div> : null}
                   <button className="primary-btn" disabled={loadingAuth} type="submit">
-                    {loadingAuth ? '处理中...' : setupStatus.needs_admin_setup ? '创建管理员并进入' : authMode === 'login' ? '登录' : '注册并进入'}
+                    {loadingAuth ? '处理中...' : setupStatus.needs_admin_setup ? '创建管理员并进入' : effectiveAuthMode === 'login' ? '登录' : '注册并进入'}
                   </button>
                   {setupStatus.needs_admin_setup ? (
                     <div className="hint-text">该入口只在系统尚未创建任何管理员时开放。</div>
@@ -1541,7 +1584,7 @@ function App() {
                     )
                   })}
                 </select>
-                <select className="provider-select inline" value={selectedProviderId ?? ''} onChange={(event) => setSelectedProviderId(Number(event.target.value))}>
+                <select className="provider-select inline" value={selectedProviderId ?? ''} onChange={(event) => applyProviderSelection(Number(event.target.value))}>
                   {providers.map((provider) => (
                     <option key={provider.id} value={provider.id}>{provider.name} / {provider.model_name}</option>
                   ))}
