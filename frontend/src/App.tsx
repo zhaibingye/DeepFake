@@ -3,11 +3,9 @@ import type { Dispatch, SetStateAction } from 'react'
 import {
   Bot,
   BrainCircuit,
-  ChevronRight,
   Eye,
   FileImage,
   LayoutDashboard,
-  LoaderCircle,
   LogOut,
   MessageSquarePlus,
   PanelLeftClose,
@@ -20,10 +18,12 @@ import {
   Sparkles,
   Trash2,
   UserRound,
-  Wrench,
 } from 'lucide-react'
 import { api } from './api'
 import { MarkdownView } from './components/MarkdownView'
+import { TimelineList } from './components/chat/TimelineList'
+import { toRenderableTimeline } from './components/chat/timeline'
+import { useTimelineState } from './components/chat/useTimelineState.ts'
 import './App.css'
 import type {
   AdminManagedUser,
@@ -33,13 +33,11 @@ import type {
   ChatDonePayload,
   ChatStreamEvent,
   Conversation,
-  Message,
   Provider,
   SearchProviderAvailability,
   SearchProviderKind,
   SearchProviderStatus,
   SetupStatus,
-  StreamActivity,
   ThinkingEffort,
   User,
 } from './types'
@@ -59,10 +57,6 @@ type DialogState = {
   resolve: (value: boolean | string | null) => void
 }
 
-type ChatMessage = Message & {
-  activities?: StreamActivity[]
-}
-
 const defaultProviderForm = {
   name: '',
   api_url: '',
@@ -79,190 +73,6 @@ const defaultProviderForm = {
 
 const thinkingEffortOptions: ThinkingEffort[] = ['low', 'medium', 'high', 'max']
 const searchProviderOptions: SearchProviderKind[] = ['exa', 'tavily']
-
-function upsertStreamActivity(list: StreamActivity[], next: StreamActivity) {
-  const index = list.findIndex((item) => item.id === next.id)
-  if (index === -1) return [...list, next]
-  return list.map((item, itemIndex) => (itemIndex === index ? { ...item, ...next } : item))
-}
-
-function formatActivityDuration(durationMs?: number) {
-  if (!durationMs || durationMs < 0) return ''
-  return `${(durationMs / 1000).toFixed(1)}s`
-}
-
-function sumThinkingDuration(activities?: StreamActivity[]) {
-  return (activities ?? [])
-    .filter((activity) => activity.kind === 'thinking' && activity.status !== 'running')
-    .reduce((total, activity) => total + (activity.duration_ms ?? 0), 0)
-}
-
-function toolActivities(activities?: StreamActivity[]) {
-  return (activities ?? []).filter((activity) => activity.kind === 'tool')
-}
-
-function defaultExpandedActivities(activities: StreamActivity[]) {
-  return Object.fromEntries(activities.map((activity) => [activity.id, activity.status === 'error'])) as Record<string, boolean>
-}
-
-function activityStatusIndex(activities: StreamActivity[]) {
-  return Object.fromEntries(activities.map((activity) => [activity.id, activity.status])) as Record<string, StreamActivity['status']>
-}
-
-function formatThinkingLabel(durationMs?: number, isStreaming = false) {
-  if (durationMs && durationMs > 0) {
-    return `已思考（用时 ${Math.max(1, Math.round(durationMs / 1000))} 秒）`
-  }
-  return isStreaming ? '正在思考' : '已思考'
-}
-
-function attachActivitiesToAssistantMessage(messages: Message[], activities: StreamActivity[]): ChatMessage[] {
-  if (!activities.length) return messages as ChatMessage[]
-  let attached = false
-  return messages.map((message) => {
-    if (attached || message.role !== 'assistant') {
-      return message as ChatMessage
-    }
-    attached = true
-    return {
-      ...message,
-      activities,
-    }
-  })
-}
-
-function ActivityList({ activities }: { activities: StreamActivity[] }) {
-  const [expandedById, setExpandedById] = useState<Record<string, boolean>>(() => defaultExpandedActivities(activities))
-  const previousStatusesRef = useRef<Record<string, StreamActivity['status']>>(activityStatusIndex(activities))
-
-  useEffect(() => {
-    const nextStatuses = activityStatusIndex(activities)
-    setExpandedById((prev) => {
-      let changed = Object.keys(prev).length !== activities.length
-      const next = defaultExpandedActivities(activities)
-      for (const activity of activities) {
-        const previousExpanded = prev[activity.id]
-        const previousStatus = previousStatusesRef.current[activity.id]
-        if (previousExpanded !== undefined) {
-          next[activity.id] = previousExpanded
-        }
-        if (previousStatus !== 'error' && activity.status === 'error') {
-          next[activity.id] = true
-        }
-        if (!changed && next[activity.id] !== prev[activity.id]) {
-          changed = true
-        }
-      }
-      previousStatusesRef.current = nextStatuses
-      return changed ? next : prev
-    })
-  }, [activities])
-
-  if (!activities.length) return null
-  return (
-    <div className="stream-activity-list compact">
-      {activities.map((activity) => {
-        const duration = activity.status !== 'running' ? formatActivityDuration(activity.duration_ms) : ''
-        const expandable = Boolean(activity.output && activity.status !== 'running')
-        const cardHeader = (
-          <>
-            <div className="stream-activity-main">
-              <span className={activity.kind === 'tool' ? 'stream-activity-icon tool' : 'stream-activity-icon'}>
-                {activity.kind === 'tool' ? <Wrench size={14} /> : <BrainCircuit size={14} />}
-              </span>
-              <div className="stream-activity-copy">
-                <strong className="stream-activity-title">
-                  <span>{activity.label}</span>
-                  {duration ? <em>({duration})</em> : null}
-                </strong>
-                {activity.detail ? <small>{activity.detail}</small> : null}
-              </div>
-            </div>
-            <div className="stream-activity-meta">
-              {activity.status === 'running' ? <LoaderCircle className="stream-activity-spinner" size={14} /> : null}
-              {expandable ? <span className="stream-activity-expand-label">展开</span> : null}
-              <ChevronRight className={expandable ? 'stream-activity-chevron' : 'stream-activity-chevron muted'} size={14} />
-            </div>
-          </>
-        )
-        if (!expandable) {
-          return (
-            <div className={activity.status === 'error' ? 'stream-activity-card error static' : 'stream-activity-card static'} key={activity.id}>
-              <div className="stream-activity-summary">{cardHeader}</div>
-            </div>
-          )
-        }
-        return (
-          <details
-            className={activity.status === 'error' ? 'stream-activity-card error' : 'stream-activity-card'}
-            key={activity.id}
-            onToggle={(event) => {
-              const nextOpen = (event.currentTarget as HTMLDetailsElement).open
-              setExpandedById((prev) => {
-                if (prev[activity.id] === nextOpen) return prev
-                return {
-                  ...prev,
-                  [activity.id]: nextOpen,
-                }
-              })
-            }}
-            open={Boolean(expandedById[activity.id])}
-          >
-            <summary className="stream-activity-summary">
-              {cardHeader}
-            </summary>
-            <div className="stream-activity-output">
-              <div className="stream-activity-output-shell">
-                <div className="markdown-body compact">
-                  <MarkdownView content={activity.output || ''} enableMath={false} />
-                </div>
-              </div>
-            </div>
-          </details>
-        )
-      })}
-    </div>
-  )
-}
-
-function ThinkingPanel({
-  content,
-  label,
-  open,
-  onToggle,
-}: {
-  content: string
-  label: string
-  open?: boolean
-  onToggle?: (nextOpen: boolean) => void
-}) {
-  const [internalOpen, setInternalOpen] = useState(false)
-  const expanded = open ?? internalOpen
-
-  function handleToggle() {
-    const nextOpen = !expanded
-    if (open === undefined) {
-      setInternalOpen(nextOpen)
-    }
-    onToggle?.(nextOpen)
-  }
-
-  return (
-    <div className={expanded ? 'thinking-box deepseek open' : 'thinking-box deepseek'}>
-      <button className="thinking-summary" onClick={handleToggle} type="button">
-        <span className="thinking-summary-main"><BrainCircuit size={14} /> {label}</span>
-        <ChevronRight className="thinking-summary-chevron" size={14} />
-      </button>
-      {expanded ? (
-        <div className="thinking-box-body">
-          <div className="thinking-box-content">
-            <MarkdownView content={content} enableMath={false} />
-          </div>
-        </div>
-      ) : null}
-    </div>
-  )
-}
 
 function normalizeThinkingEffort(effort: string): ThinkingEffort {
   if (thinkingEffortOptions.includes(effort as ThinkingEffort)) return effort as ThinkingEffort
@@ -341,7 +151,7 @@ function App() {
   const [conversations, setConversations] = useState<Conversation[]>([])
   const [activeConversationId, setActiveConversationId] = useState<number | null>(null)
   const [activeConversation, setActiveConversation] = useState<Conversation | null>(null)
-  const [messages, setMessages] = useState<ChatMessage[]>([])
+  const [messages, setMessages] = useState<ChatDonePayload['messages']>([])
   const [selectedProviderId, setSelectedProviderId] = useState<number | null>(null)
   const [input, setInput] = useState('')
   const [attachments, setAttachments] = useState<Attachment[]>([])
@@ -353,8 +163,7 @@ function App() {
   const [effort, setEffort] = useState<ThinkingEffort>('high')
   const [chatError, setChatError] = useState('')
   const [chatLoading, setChatLoading] = useState(false)
-  const [streamingAssistant, setStreamingAssistant] = useState<{ text: string; thinking: string; activities: StreamActivity[] } | null>(null)
-  const [streamThinkingExpanded, setStreamThinkingExpanded] = useState(true)
+  const streamingTimeline = useTimelineState()
   const [pendingUserMessage, setPendingUserMessage] = useState<{ text: string; attachments: Attachment[]; createdAt: string } | null>(null)
   const [providerForm, setProviderForm] = useState(defaultProviderForm)
   const [providerSuccess, setProviderSuccess] = useState('')
@@ -371,8 +180,6 @@ function App() {
   const messageEndRef = useRef<HTMLDivElement | null>(null)
   const shouldFollowStreamRef = useRef(true)
   const streamAbortRef = useRef<AbortController | null>(null)
-  const streamThinkingExpandedRef = useRef(true)
-  const streamThinkingManuallyExpandedRef = useRef(false)
   const authSessionVersionRef = useRef(0)
 
   const selectedProvider = providers.find((provider) => provider.id === selectedProviderId) ?? null
@@ -383,7 +190,7 @@ function App() {
   const selectedProviderSupportsToolCalling = Boolean(selectedProvider?.supports_tool_calling)
   const selectedSearchProviderStatus = searchProviders?.[searchProvider] ?? null
   const isAdminRoute = route === 'admin'
-  const hasVisibleConversation = messages.length > 0 || !!pendingUserMessage || !!streamingAssistant
+  const hasVisibleConversation = messages.length > 0 || !!pendingUserMessage || streamingTimeline.parts.length > 0
   const providerApiUrlPlaceholder = 'https://.../anthropic/v1'
   const filteredAdminUsers = adminUsers.filter((managedUser) => {
     const keyword = userSearch.trim().toLowerCase()
@@ -433,30 +240,6 @@ function App() {
     streamAbortRef.current = null
   }
 
-  function setStreamThinkingPanelExpanded(nextExpanded: boolean) {
-    streamThinkingExpandedRef.current = nextExpanded
-    setStreamThinkingExpanded(nextExpanded)
-  }
-
-  function resetStreamThinkingPanel() {
-    streamThinkingManuallyExpandedRef.current = false
-    setStreamThinkingPanelExpanded(true)
-  }
-
-  function collapseStreamThinkingPanel() {
-    if (streamThinkingManuallyExpandedRef.current || !streamThinkingExpandedRef.current) {
-      return
-    }
-    setStreamThinkingPanelExpanded(false)
-  }
-
-  function handleStreamThinkingToggle(nextOpen: boolean) {
-    setStreamThinkingPanelExpanded(nextOpen)
-    if (nextOpen) {
-      streamThinkingManuallyExpandedRef.current = true
-    }
-  }
-
   function resetSearchState() {
     setEnableSearch(false)
     setSearchProvider('exa')
@@ -502,11 +285,15 @@ function App() {
     if (!shouldFollowStreamRef.current) {
       return
     }
-    messageEndRef.current?.scrollIntoView({ behavior: streamingAssistant ? 'auto' : 'smooth' })
-  }, [messages, streamingAssistant])
+    messageEndRef.current?.scrollIntoView({ behavior: streamingTimeline.parts.length ? 'auto' : 'smooth' })
+  }, [messages, streamingTimeline.revision])
 
   useEffect(() => {
-    const handleScroll = () => updateFollowStreamState()
+    const handleScroll = () => {
+      const root = document.documentElement
+      const distanceToBottom = root.scrollHeight - window.scrollY - window.innerHeight
+      shouldFollowStreamRef.current = distanceToBottom < 80
+    }
     window.addEventListener('scroll', handleScroll, { passive: true })
     return () => window.removeEventListener('scroll', handleScroll)
   }, [])
@@ -721,7 +508,7 @@ function App() {
     setSelectedProviderId(null)
     setAttachments([])
     setChatLoading(false)
-    setStreamingAssistant(null)
+    streamingTimeline.reset()
     setInput('')
     resetSearchState()
     setPendingUserMessage(null)
@@ -737,6 +524,7 @@ function App() {
     setActiveConversation({ ...summary, ...result.conversation })
     setSelectedProviderId(result.conversation.provider_id)
     setMessages(result.messages)
+    streamingTimeline.reset()
     setPendingUserMessage(null)
     if (route !== 'chat') {
       navigateTo('chat')
@@ -752,17 +540,11 @@ function App() {
     setInput('')
     setAttachments([])
     setChatError('')
-    setStreamingAssistant(null)
+    streamingTimeline.reset()
     setPendingUserMessage(null)
     if (route !== 'chat') {
       navigateTo('chat')
     }
-  }
-
-  function updateFollowStreamState() {
-    const root = document.documentElement
-    const distanceToBottom = root.scrollHeight - window.scrollY - window.innerHeight
-    shouldFollowStreamRef.current = distanceToBottom < 80
   }
 
   async function sendMessage() {
@@ -790,12 +572,10 @@ function App() {
     const previousMessages = messages
     const currentTitle = currentConversation?.title
     const currentCreatedAt = currentConversation?.created_at
-    let streamedActivities: StreamActivity[] = []
     let streamedConversationId: number | null = null
     setChatError('')
     setChatLoading(true)
-    resetStreamThinkingPanel()
-    setStreamingAssistant(null)
+    streamingTimeline.reset()
     setInput('')
     setAttachments([])
     setPendingUserMessage({
@@ -841,37 +621,16 @@ function App() {
           }
           return
         }
-        if (chunk.type === 'text_delta') {
-          const delta = chunk.delta
-          if (delta) {
-            collapseStreamThinkingPanel()
-          }
-          setStreamingAssistant((prev) => ({
-            text: `${prev?.text ?? ''}${delta}`,
-            thinking: prev?.thinking ?? '',
-            activities: prev?.activities ?? [],
-          }))
-          return
-        }
-        if (chunk.type === 'thinking_delta') {
-          const delta = chunk.delta
-          setStreamingAssistant((prev) => ({
-            text: prev?.text ?? '',
-            thinking: `${prev?.thinking ?? ''}${delta}`,
-            activities: prev?.activities ?? [],
-          }))
-          return
-        }
-        if (chunk.type === 'activity') {
-          const activity = chunk.activity
-          if (activity?.id) {
-            streamedActivities = upsertStreamActivity(streamedActivities, activity)
-            setStreamingAssistant((prev) => ({
-              text: prev?.text ?? '',
-              thinking: prev?.thinking ?? '',
-              activities: upsertStreamActivity(prev?.activities ?? [], activity),
-            }))
-          }
+        if (
+          chunk.type === 'timeline_part_start' ||
+          chunk.type === 'timeline_part_delta' ||
+          chunk.type === 'timeline_part_end' ||
+          chunk.type === 'timeline_part_error' ||
+          chunk.type === 'thinking_delta' ||
+          chunk.type === 'text_delta' ||
+          chunk.type === 'activity'
+        ) {
+          streamingTimeline.dispatchTimelineEvent(chunk)
           return
         }
         if (chunk.type === 'done') {
@@ -896,10 +655,9 @@ function App() {
 
       setActiveConversationId(donePayload.conversation.id)
       setActiveConversation(donePayload.conversation)
-      const completedMessages = attachActivitiesToAssistantMessage(donePayload.messages, streamedActivities)
-      setMessages((prev) => (currentConversationId ? [...prev, ...completedMessages] : completedMessages))
+      setMessages((prev) => (currentConversationId ? [...prev, ...donePayload.messages] : donePayload.messages))
       setPendingUserMessage(null)
-      setStreamingAssistant(null)
+      streamingTimeline.reset()
       await loadConversationsForSession(token, sessionVersion)
     } catch (error) {
       if (sessionVersion !== authSessionVersionRef.current) {
@@ -909,7 +667,7 @@ function App() {
       setActiveConversation(previousConversation)
       setMessages(previousMessages)
       setPendingUserMessage(null)
-      setStreamingAssistant(null)
+      streamingTimeline.reset()
       const aborted =
         error instanceof DOMException
           ? error.name === 'AbortError'
@@ -1654,23 +1412,20 @@ function App() {
                     <span className="message-role">{message.role === 'user' ? user.username : currentConversationProvider?.name ?? selectedProvider?.name ?? 'AI'}</span>
                     <time>{formatDateTime(message.created_at)}</time>
                   </div>
-                  {message.thinking_text ? (
-                    <ThinkingPanel
-                      content={message.thinking_text}
-                      label={formatThinkingLabel(sumThinkingDuration(message.activities), false)}
-                    />
-                  ) : null}
-                  {toolActivities(message.activities).length ? <ActivityList activities={toolActivities(message.activities)} /> : null}
-                  <div className={message.role === 'user' ? 'message-bubble user' : 'message-bubble assistant'}>
-                    <div className="markdown-body">
-                      <MarkdownView content={messagePlainText(message.content)} />
+                  {message.role === 'assistant' ? (
+                    <TimelineList parts={toRenderableTimeline(message)} />
+                  ) : (
+                    <div className="message-bubble user">
+                      <div className="markdown-body">
+                        <MarkdownView content={messagePlainText(message.content)} />
+                      </div>
+                      <div className="image-grid">
+                        {messageImages(message.content).map((image, index) => (
+                          <img key={`${message.id}-${index}`} alt="uploaded" src={`data:${image.media_type};base64,${image.data}`} />
+                        ))}
+                      </div>
                     </div>
-                    <div className="image-grid">
-                      {messageImages(message.content).map((image, index) => (
-                        <img key={`${message.id}-${index}`} alt="uploaded" src={`data:${image.media_type};base64,${image.data}`} />
-                      ))}
-                    </div>
-                  </div>
+                  )}
                 </article>
               ))}
               {pendingUserMessage ? (
@@ -1691,26 +1446,17 @@ function App() {
                   </div>
                 </article>
               ) : null}
-              {streamingAssistant ? (
+              {streamingTimeline.parts.length ? (
                 <article className="message-row assistant">
                   <div className="message-meta-row">
                     <span className="message-role">{selectedProvider?.name ?? 'AI'}</span>
                     <time>{selectedProvider?.model_name ?? ''}</time>
                   </div>
-                  {streamingAssistant.thinking ? (
-                    <ThinkingPanel
-                      content={streamingAssistant.thinking}
-                      label={formatThinkingLabel(sumThinkingDuration(streamingAssistant.activities), true)}
-                      open={streamThinkingExpanded}
-                      onToggle={handleStreamThinkingToggle}
-                    />
-                  ) : null}
-                  <ActivityList activities={toolActivities(streamingAssistant.activities)} />
-                  <div className="message-bubble assistant stream">
-                    <div className="markdown-body">
-                      <MarkdownView content={streamingAssistant.text || '...'} />
-                    </div>
-                  </div>
+                  <TimelineList
+                    parts={streamingTimeline.parts}
+                    expandedById={streamingTimeline.expandedById}
+                    onToggle={streamingTimeline.setExpanded}
+                  />
                 </article>
               ) : null}
               <div ref={messageEndRef} />
