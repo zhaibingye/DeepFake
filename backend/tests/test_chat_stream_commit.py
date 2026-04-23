@@ -214,43 +214,34 @@ class ChatStreamCommitTests(unittest.TestCase):
         events = self.parse_stream_events(response)
         self.assertEqual(events[0]["type"], "conversation")
         self.assertEqual(events[-1]["type"], "done")
+        self.assertFalse(
+            any(
+                event["type"] in {"text_delta", "thinking_delta", "activity"}
+                for event in events
+            )
+        )
 
         messages = self.fetch_messages()
         self.assertEqual(self.count_conversations(), 1)
         self.assertEqual(
-            messages,
-            [
-                {
-                    "role": "user",
-                    "content_text": "你好",
-                    "content_json": None,
-                    "thinking_text": "",
-                },
-                {
-                    "role": "assistant",
-                    "content_text": "世界",
-                    "content_json": json.dumps(
-                        {
-                            "parts": [
-                                {
-                                    "id": "thinking-1",
-                                    "kind": "thinking",
-                                    "status": "done",
-                                    "text": "思考中",
-                                },
-                                {
-                                    "id": "answer-1",
-                                    "kind": "answer",
-                                    "status": "done",
-                                    "text": "世界",
-                                },
-                            ]
-                        },
-                        ensure_ascii=False,
-                    ),
-                    "thinking_text": "思考中",
-                },
-            ],
+            messages[0],
+            {
+                "role": "user",
+                "content_text": "你好",
+                "content_json": None,
+                "thinking_text": "",
+            },
+        )
+        self.assertEqual(messages[1]["role"], "assistant")
+        self.assertEqual(messages[1]["content_text"], "世界")
+        self.assertEqual(messages[1]["thinking_text"], "思考中")
+        assistant_parts = json.loads(messages[1]["content_json"] or "{}")["parts"]
+        self.assertEqual(
+            {(part["kind"], part["text"], part["status"]) for part in assistant_parts},
+            {
+                ("thinking", "思考中", "done"),
+                ("answer", "世界", "done"),
+            },
         )
 
     def test_done_payload_returns_assistant_parts_in_order(self) -> None:
@@ -273,6 +264,12 @@ class ChatStreamCommitTests(unittest.TestCase):
 
         events = self.parse_stream_events(response)
         self.assertEqual(events[-1]["type"], "done")
+        self.assertFalse(
+            any(
+                event["type"] in {"text_delta", "thinking_delta", "activity"}
+                for event in events
+            )
+        )
         assistant = events[-1]["messages"][1]
         self.assertEqual(assistant["role"], "assistant")
         self.assertIsInstance(assistant["content"], str)
@@ -1042,19 +1039,17 @@ class ChatStreamCommitTests(unittest.TestCase):
         self.assertEqual(tools_call.args[2]["MCP-Session-Id"], "session-123")
 
     def test_run_exa_search_calls_exa_remote_mcp_tool(self) -> None:
-        with patch("app.chat_service.call_remote_mcp_tool") as call_remote_mcp_tool:
-            call_remote_mcp_tool.return_value = {
-                "content": [
-                    {"type": "text", "text": "结果 1"},
-                    {"type": "text", "text": "结果 2"},
-                ]
+        with patch("app.tool_runtime.execute_native_search_tool") as execute_native_search_tool:
+            execute_native_search_tool.return_value = {
+                "label": "Exa 搜索",
+                "detail": "返回 2 个内容块",
+                "output": "结果 1\n\n结果 2",
             }
 
             result = chat_service.run_exa_search("查一下")
 
-        call_remote_mcp_tool.assert_called_once_with(
-            "https://mcp.exa.ai/mcp",
-            "web_search_exa",
+        execute_native_search_tool.assert_called_once_with(
+            "exa",
             {"query": "查一下"},
         )
         self.assertEqual(
@@ -1075,17 +1070,21 @@ class ChatStreamCommitTests(unittest.TestCase):
                 "is_configured": True,
             },
         ):
-            with patch("app.chat_service.call_remote_mcp_tool") as call_remote_mcp_tool:
-                call_remote_mcp_tool.return_value = {
-                    "content": [{"type": "text", "text": "Tavily 结果"}]
+            with patch(
+                "app.tool_runtime.execute_native_search_tool"
+            ) as execute_native_search_tool:
+                execute_native_search_tool.return_value = {
+                    "label": "Tavily 搜索",
+                    "detail": "返回 1 个内容块",
+                    "output": "Tavily 结果",
                 }
 
                 result = chat_service.run_tavily_search("查 tavily")
 
-        call_remote_mcp_tool.assert_called_once_with(
-            "https://mcp.tavily.com/mcp/?tavilyApiKey=tvly-secret",
-            "tavily-search",
+        execute_native_search_tool.assert_called_once_with(
+            "tavily",
             {"query": "查 tavily"},
+            tavily_api_key="tvly-secret",
         )
         self.assertEqual(
             result,
@@ -1183,7 +1182,7 @@ class ChatStreamCommitTests(unittest.TestCase):
         events = self.parse_stream_events(response)
         self.assertEqual(events[-1]["type"], "done")
 
-    def test_search_enabled_does_not_emit_legacy_activity_events(self) -> None:
+    def test_search_enabled_does_not_emit_legacy_stream_events(self) -> None:
         provider_id = self.create_provider()
         self.enable_provider_tool_support(provider_id)
 
@@ -1207,7 +1206,12 @@ class ChatStreamCommitTests(unittest.TestCase):
         events = self.parse_stream_events(response)
         self.assertEqual(events[0]["type"], "conversation")
         self.assertEqual(events[-1]["type"], "done")
-        self.assertFalse(any(event["type"] == "activity" for event in events))
+        self.assertFalse(
+            any(
+                event["type"] in {"text_delta", "thinking_delta", "activity"}
+                for event in events
+            )
+        )
         self.assertEqual(self.count_conversations(), 1)
 
     def test_empty_message_keeps_original_http_400(self) -> None:

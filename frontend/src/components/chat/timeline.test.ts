@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
@@ -119,57 +121,81 @@ describe('timeline helpers', () => {
     expect(state.expandedById['answer-1']).toBe(true)
   })
 
-  it('converts legacy streaming events into timeline parts', () => {
+  it('applies timeline streaming events into ordered parts', () => {
     let state: TimelineState = { parts: [], expandedById: {}, manuallyExpanded: {} }
 
-    state = reduceTimelineState(state, { type: 'thinking_delta', delta: '先分析' })
     state = reduceTimelineState(state, {
-      type: 'activity',
-      activity: {
-        id: 'tool-1',
-        kind: 'tool',
-        label: 'Exa 搜索',
+      type: 'timeline_part_start',
+      part: {
+        id: 'thinking-1',
+        kind: 'thinking',
         status: 'running',
+        text: '',
       },
     })
     state = reduceTimelineState(state, {
-      type: 'activity',
-      activity: {
+      type: 'timeline_part_delta',
+      part_id: 'thinking-1',
+      delta: {
+        text: '先分析',
+      },
+    })
+    state = reduceTimelineState(state, { type: 'timeline_part_end', part_id: 'thinking-1' })
+    state = reduceTimelineState(state, {
+      type: 'timeline_part_start',
+      part: {
         id: 'tool-1',
         kind: 'tool',
+        status: 'running',
         label: 'Exa 搜索',
+      },
+    })
+    state = reduceTimelineState(state, {
+      type: 'timeline_part_delta',
+      part_id: 'tool-1',
+      delta: {
         status: 'done',
         output: '命中结果',
       },
     })
-    state = reduceTimelineState(state, { type: 'text_delta', delta: '最终回答' })
-
-    expect(state.parts).toEqual([
-      { id: 'legacy-thinking', kind: 'thinking', status: 'running', text: '先分析' },
-      { id: 'tool-1', kind: 'tool', status: 'done', label: 'Exa 搜索', output: '命中结果' },
-      { id: 'legacy-answer', kind: 'answer', status: 'running', text: '最终回答' },
-    ])
-    expect(state.expandedById['legacy-thinking']).toBe(false)
-    expect(state.expandedById['tool-1']).toBe(false)
-    expect(state.expandedById['legacy-answer']).toBe(true)
-  })
-
-  it('ignores legacy thinking activity without thinking text', () => {
-    let state: TimelineState = { parts: [], expandedById: {}, manuallyExpanded: {} }
-
+    state = reduceTimelineState(state, { type: 'timeline_part_end', part_id: 'tool-1' })
     state = reduceTimelineState(state, {
-      type: 'activity',
-      activity: {
-        id: 'thinking-1',
-        kind: 'thinking',
-        label: '思考中',
+      type: 'timeline_part_start',
+      part: {
+        id: 'answer-1',
+        kind: 'answer',
         status: 'running',
-        detail: '正在组织答案',
+        text: '',
+      },
+    })
+    state = reduceTimelineState(state, {
+      type: 'timeline_part_delta',
+      part_id: 'answer-1',
+      delta: {
+        text: '最终回答',
       },
     })
 
-    expect(state.parts).toEqual([])
-    expect(state.expandedById).toEqual({})
+    expect(state.parts).toEqual([
+      { id: 'thinking-1', kind: 'thinking', status: 'done', text: '先分析' },
+      { id: 'tool-1', kind: 'tool', status: 'done', label: 'Exa 搜索', output: '命中结果' },
+      { id: 'answer-1', kind: 'answer', status: 'running', text: '最终回答' },
+    ])
+    expect(state.expandedById['thinking-1']).toBe(false)
+    expect(state.expandedById['tool-1']).toBe(false)
+    expect(state.expandedById['answer-1']).toBe(true)
+  })
+
+  it('keeps legacy stream events out of app dispatch logic', () => {
+    const appSource = readFileSync(resolve(process.cwd(), 'src/App.tsx'), 'utf8')
+
+    expect(appSource).toContain("chunk.type === 'timeline_part_start'")
+    expect(appSource).toContain("chunk.type === 'timeline_part_delta'")
+    expect(appSource).toContain("chunk.type === 'timeline_part_end'")
+    expect(appSource).toContain("chunk.type === 'timeline_part_error'")
+    expect(appSource).not.toContain("chunk.type === 'thinking_delta'")
+    expect(appSource).not.toContain("chunk.type === 'text_delta'")
+    expect(appSource).not.toContain("chunk.type === 'activity'")
   })
 
   it('extracts answer text from timeline parts content', () => {

@@ -994,13 +994,23 @@ async def stream_message(
             part = timeline.create_part(part_id, kind, **fields)
             return remember_part(index, part)
 
-        def resolve_index(data: dict[str, Any], *, prefer_active: bool = True) -> int:
+        def resolve_index(
+            data: dict[str, Any],
+            *,
+            prefer_active: bool = True,
+            expected_kind: str | None = None,
+        ) -> int:
             nonlocal fallback_index
             raw_index = data.get("index")
             if isinstance(raw_index, int):
                 return raw_index
             if prefer_active and active_parts:
-                return next(reversed(active_parts))
+                if expected_kind:
+                    for active_index in reversed(active_parts):
+                        if active_parts[active_index].get("kind") == expected_kind:
+                            return active_index
+                else:
+                    return next(reversed(active_parts))
             fallback_index += 1
             return 1000 + fallback_index
 
@@ -1117,9 +1127,9 @@ async def stream_message(
                             )
                             yield emit({"type": "timeline_part_start", "part": part})
                     elif event_type == "content_block_delta":
-                        index = resolve_index(data)
                         delta = data.get("delta", {})
                         if delta.get("type") == "input_json_delta":
+                            index = resolve_index(data)
                             tool_use_block = pending_tool_use_inputs.get(index)
                             if tool_use_block is not None:
                                 tool_use_block["partial_json"] = (
@@ -1129,6 +1139,7 @@ async def stream_message(
                         text = delta.get("text")
                         thinking = delta.get("thinking")
                         if thinking:
+                            index = resolve_index(data, expected_kind="thinking")
                             part = active_parts.get(index)
                             if not part:
                                 thinking_count += 1
@@ -1150,8 +1161,8 @@ async def stream_message(
                                     "delta": {"text": thinking},
                                 }
                             )
-                            yield emit({"type": "thinking_delta", "delta": thinking})
                         if text:
+                            index = resolve_index(data, expected_kind="answer")
                             part = active_parts.get(index)
                             if not part:
                                 answer_count += 1
@@ -1173,7 +1184,6 @@ async def stream_message(
                                     "delta": {"text": text},
                                 }
                             )
-                            yield emit({"type": "text_delta", "delta": text})
                     elif event_type == "content_block_stop":
                         index = resolve_index(data)
                         tool_use_block = pending_tool_use_inputs.pop(index, None)

@@ -625,10 +625,7 @@ function App() {
           chunk.type === 'timeline_part_start' ||
           chunk.type === 'timeline_part_delta' ||
           chunk.type === 'timeline_part_end' ||
-          chunk.type === 'timeline_part_error' ||
-          chunk.type === 'thinking_delta' ||
-          chunk.type === 'text_delta' ||
-          chunk.type === 'activity'
+          chunk.type === 'timeline_part_error'
         ) {
           streamingTimeline.dispatchTimelineEvent(chunk)
           return
