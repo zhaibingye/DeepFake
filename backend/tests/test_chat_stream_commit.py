@@ -591,26 +591,62 @@ class ChatStreamCommitTests(unittest.TestCase):
         self.assertEqual(events[-1]["type"], "done")
         self.assertEqual(self.count_conversations(), 1)
 
-    def test_search_tool_use_without_tool_loop_rolls_back_round(self) -> None:
+    def test_native_tool_call_emits_timeline_parts_in_order(self) -> None:
         provider_id = self.create_provider()
         self.enable_provider_tool_support(provider_id)
+        provider_payloads: list[dict[str, object]] = []
 
         async def fake_stream_provider_events(provider, payload):
-            self.assertEqual(payload["tools"][0]["name"], "exa_search")
-            yield (
-                'data: {"type":"content_block_start","content_block":'
-                '{"type":"tool_use","id":"toolu_123","name":"exa_search",'
-                '"input":{"query":"查一下"}}}'
+            provider_payloads.append(json.loads(json.dumps(payload)))
+            if len(provider_payloads) == 1:
+                self.assertEqual(payload["tools"][0]["name"], "exa_search")
+                yield 'data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}'
+                yield 'data: {"type":"content_block_delta","index":0,"delta":{"thinking":"先分析"}}'
+                yield 'data: {"type":"content_block_stop","index":0}'
+                yield 'data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","name":"exa_search","id":"toolu_1","input":{"query":"你好"}}}'
+                yield 'data: {"type":"content_block_stop","index":1}'
+                yield 'data: {"type":"message_stop"}'
+                return
+
+            assistant_tool_use_message = payload["messages"][-2]
+            tool_result_message = payload["messages"][-1]
+            self.assertEqual(assistant_tool_use_message["role"], "assistant")
+            self.assertEqual(
+                assistant_tool_use_message["content"],
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "exa_search",
+                        "input": {"query": "你好"},
+                    }
+                ],
             )
-            yield 'data: {"type":"content_block_stop"}'
+            self.assertEqual(tool_result_message["role"], "user")
+            self.assertEqual(
+                tool_result_message["content"],
+                [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": "结果",
+                    }
+                ],
+            )
+            yield 'data: {"type":"content_block_start","index":2,"content_block":{"type":"text"}}'
+            yield 'data: {"type":"content_block_delta","index":2,"delta":{"text":"最终回答"}}'
+            yield 'data: {"type":"content_block_stop","index":2}'
             yield 'data: {"type":"message_stop"}'
 
-        with patch("app.main.stream_provider_events", fake_stream_provider_events):
+        with patch("app.main.stream_provider_events", fake_stream_provider_events), patch(
+            "app.tool_runtime.execute_native_search_tool",
+            return_value={"label": "Exa 搜索", "detail": "返回 1 个内容块", "output": "结果"},
+        ) as execute_native_search_tool:
             response = self.client.post(
                 "/api/chat/stream",
                 json={
                     "provider_id": provider_id,
-                    "text": "查一下",
+                    "text": "你好",
                     "enable_search": True,
                     "search_provider": "exa",
                     "attachments": [],
@@ -620,8 +656,162 @@ class ChatStreamCommitTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         events = self.parse_stream_events(response)
         self.assertEqual(events[0]["type"], "conversation")
-        self.assertEqual(events[-1]["type"], "error")
-        self.assertIn("tool_use", events[-1]["detail"])
+        self.assertEqual(
+            [event["type"] for event in events if event["type"].startswith("timeline_part")],
+            [
+                "timeline_part_start",
+                "timeline_part_delta",
+                "timeline_part_end",
+                "timeline_part_start",
+                "timeline_part_delta",
+                "timeline_part_end",
+                "timeline_part_start",
+                "timeline_part_delta",
+                "timeline_part_end",
+            ],
+        )
+        execute_native_search_tool.assert_called_once_with("exa", {"query": "你好"}, "")
+        self.assertEqual(len(provider_payloads), 2)
+        self.assertEqual(events[-1]["type"], "done")
+        assistant = events[-1]["messages"][1]
+        self.assertEqual(
+            [part["kind"] for part in assistant["parts"]],
+            ["thinking", "tool", "answer"],
+        )
+        self.assertEqual(assistant["parts"][0]["text"], "先分析")
+        self.assertEqual(assistant["parts"][1]["output"], "结果")
+        self.assertEqual(assistant["parts"][2]["text"], "最终回答")
+        messages = self.fetch_messages()
+        self.assertEqual(len(messages), 2)
+        persisted_parts = json.loads(messages[1]["content_json"])["parts"]
+        self.assertEqual(
+            [part["kind"] for part in persisted_parts],
+            ["thinking", "tool", "answer"],
+        )
+
+    def test_native_tool_call_waits_for_input_json_delta_until_content_block_stop(
+        self,
+    ) -> None:
+        provider_id = self.create_provider()
+        self.enable_provider_tool_support(provider_id)
+        provider_payloads: list[dict[str, object]] = []
+        state = {"tool_stop_seen": False}
+
+        async def fake_stream_provider_events(provider, payload):
+            provider_payloads.append(json.loads(json.dumps(payload)))
+            if len(provider_payloads) == 1:
+                yield 'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","name":"exa_search","id":"toolu_1","input":{}}}'
+                yield 'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"query\\": \\"你"}}'
+                yield 'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"好\\"}"}}'
+                state["tool_stop_seen"] = True
+                yield 'data: {"type":"content_block_stop","index":0}'
+                yield 'data: {"type":"message_stop"}'
+                return
+
+            assistant_tool_use_message = payload["messages"][-2]
+            tool_result_message = payload["messages"][-1]
+            self.assertEqual(
+                assistant_tool_use_message,
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_1",
+                            "name": "exa_search",
+                            "input": {"query": "你好"},
+                        }
+                    ],
+                },
+            )
+            self.assertEqual(
+                tool_result_message,
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": "结果",
+                        }
+                    ],
+                },
+            )
+            yield 'data: {"type":"content_block_start","index":1,"content_block":{"type":"text"}}'
+            yield 'data: {"type":"content_block_delta","index":1,"delta":{"text":"最终回答"}}'
+            yield 'data: {"type":"content_block_stop","index":1}'
+            yield 'data: {"type":"message_stop"}'
+
+        def fake_execute_native_search_tool(
+            kind: str,
+            arguments: dict[str, object],
+            tavily_api_key: str = "",
+        ) -> dict[str, str]:
+            self.assertTrue(state["tool_stop_seen"])
+            self.assertEqual(kind, "exa")
+            self.assertEqual(arguments, {"query": "你好"})
+            self.assertEqual(tavily_api_key, "")
+            return {"label": "Exa 搜索", "detail": "返回 1 个内容块", "output": "结果"}
+
+        with patch("app.main.stream_provider_events", fake_stream_provider_events), patch(
+            "app.tool_runtime.execute_native_search_tool",
+            side_effect=fake_execute_native_search_tool,
+        ) as execute_native_search_tool:
+            response = self.client.post(
+                "/api/chat/stream",
+                json={
+                    "provider_id": provider_id,
+                    "text": "你好",
+                    "enable_search": True,
+                    "search_provider": "exa",
+                    "attachments": [],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        events = self.parse_stream_events(response)
+        self.assertEqual(events[-1]["type"], "done")
+        execute_native_search_tool.assert_called_once()
+        self.assertEqual(len(provider_payloads), 2)
+
+    def test_native_tool_failure_emits_timeline_part_error_and_rolls_back(self) -> None:
+        provider_id = self.create_provider()
+        self.enable_provider_tool_support(provider_id)
+
+        async def fake_stream_provider_events(provider, payload):
+            yield 'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","name":"exa_search","id":"toolu_1","input":{"query":"你好"}}}'
+            yield 'data: {"type":"content_block_stop","index":0}'
+
+        with patch("app.main.stream_provider_events", fake_stream_provider_events), patch(
+            "app.tool_runtime.execute_native_search_tool",
+            side_effect=RuntimeError("搜索失败"),
+        ):
+            response = self.client.post(
+                "/api/chat/stream",
+                json={
+                    "provider_id": provider_id,
+                    "text": "你好",
+                    "enable_search": True,
+                    "search_provider": "exa",
+                    "attachments": [],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        events = self.parse_stream_events(response)
+        self.assertEqual(
+            [event["type"] for event in events],
+            [
+                "conversation",
+                "timeline_part_start",
+                "timeline_part_error",
+                "error",
+            ],
+        )
+        self.assertEqual(events[1]["part"]["kind"], "tool")
+        self.assertEqual(events[2]["part_id"], "toolu_1")
+        self.assertEqual(events[2]["detail"], "搜索失败")
+        self.assertEqual(events[-1]["detail"], "搜索失败")
         self.assertEqual(self.fetch_messages(), [])
         self.assertEqual(self.count_conversations(), 0)
 

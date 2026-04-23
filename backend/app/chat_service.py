@@ -17,6 +17,7 @@ from app.timeline import (
     assistant_content_from_row,
     create_part,
     message_parts_from_row,
+    serialize_parts,
 )
 
 MCP_PROTOCOL_VERSION = "2025-06-18"
@@ -158,6 +159,25 @@ def build_chat_request_payload(
     if stream:
         request_payload["stream"] = True
     return request_payload
+
+
+def append_tool_result_message(
+    request_payload: dict[str, Any],
+    assistant_tool_uses: list[dict[str, Any]],
+    tool_results: list[dict[str, Any]],
+) -> None:
+    request_payload["messages"].append(
+        {
+            "role": "assistant",
+            "content": list(assistant_tool_uses),
+        }
+    )
+    request_payload["messages"].append(
+        {
+            "role": "user",
+            "content": tool_results,
+        }
+    )
 
 
 def provider_supports_tool_calling(provider: sqlite3.Row) -> bool:
@@ -493,29 +513,36 @@ def prepare_stream_chat(payload: Any, user: dict[str, Any]) -> ChatStreamContext
 
 
 def commit_stream_chat(
-    context: ChatStreamContext, assistant_text: str, thinking_text: str
+    context: ChatStreamContext,
+    assistant_text: str,
+    thinking_text: str,
+    assistant_content_json: str | None = None,
 ) -> dict[str, Any]:
     assistant_created_at = utcnow()
     final_assistant_text = assistant_text.strip() or "模型没有返回可显示文本。"
     final_thinking_text = thinking_text.strip()
-    assistant_parts: list[dict[str, Any]] = []
-    if final_thinking_text:
+    if assistant_content_json is None:
+        assistant_parts: list[dict[str, Any]] = []
+        if final_thinking_text:
+            assistant_parts.append(
+                create_part(
+                    "thinking-1",
+                    "thinking",
+                    status="done",
+                    text=final_thinking_text,
+                )
+            )
         assistant_parts.append(
             create_part(
-                "thinking-1",
-                "thinking",
+                "answer-1",
+                "answer",
                 status="done",
-                text=final_thinking_text,
+                text=final_assistant_text,
             )
         )
-    assistant_parts.append(
-        create_part(
-            "answer-1",
-            "answer",
-            status="done",
-            text=final_assistant_text,
+        assistant_content_json = (
+            '{"parts":' + serialize_parts(assistant_parts) + "}"
         )
-    )
     with closing(get_conn()) as conn:
         conn.execute(
             "INSERT INTO messages (conversation_id, role, content_text, content_json, thinking_text, created_at) VALUES (?, 'user', ?, ?, '', ?)",
@@ -531,7 +558,7 @@ def commit_stream_chat(
             (
                 context.conversation_id,
                 final_assistant_text,
-                json.dumps({"parts": assistant_parts}, ensure_ascii=False),
+                assistant_content_json,
                 final_thinking_text,
                 assistant_created_at,
             ),

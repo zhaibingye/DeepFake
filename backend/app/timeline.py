@@ -75,6 +75,14 @@ def answer_text_from_parts(parts: list[dict[str, Any]]) -> str:
     )
 
 
+def thinking_text_from_parts(parts: list[dict[str, Any]]) -> str:
+    return "".join(
+        part.get("text", "")
+        for part in parts
+        if isinstance(part, dict) and part.get("kind") == "thinking"
+    )
+
+
 def assistant_content_from_row(row: Any) -> str:
     parts = message_parts_from_row(row)
     answer_text = answer_text_from_parts(parts)
