@@ -40,7 +40,7 @@
 ```text
 deepfake/
 ├─ frontend/
-│  ├─ public/                 # logo、favicon、README 截图
+│  ├─ public/                 # logo、favicon、README 截图和前端运行时配置
 │  └─ src/
 │     ├─ components/          # Markdown、聊天时间线等通用组件
 │     ├─ features/
@@ -48,10 +48,13 @@ deepfake/
 │     │  ├─ auth/             # 登录、注册、初始化管理员页面
 │     │  └─ chat/             # 聊天页面、发送控制器、搜索供应商状态
 │     ├─ api.ts               # 前端 API 封装
+│     ├─ config.ts            # 前端运行时配置读取
 │     └─ types.ts             # 前端共享类型
 ├─ backend/
+│  ├─ config.json             # 后端 CORS 允许域名配置
 │  ├─ app/
 │  │  ├─ routers/             # public/auth/admin/conversations/chat 路由
+│  │  ├─ config.py            # 后端配置读取
 │  │  ├─ provider_client.py   # 多供应商流式适配
 │  │  ├─ chat_stream_service.py
 │  │  ├─ tool_runtime.py      # 搜索工具运行时
@@ -298,17 +301,42 @@ curl -X POST http://127.0.0.1:8000/api/setup/admin \
 
 ## 前后端连接说明
 
-前端 API 地址目前写在：
+前端后端地址通过运行时配置文件设置：
 
-- `frontend/src/api.ts`
+- `frontend/public/config.js`
 
 默认值为：
 
-```ts
-const API_BASE = 'http://127.0.0.1:8000/api'
+```js
+window.DEEPFAKE_CONFIG = {
+  backendUrl: 'http://127.0.0.1:8000',
+}
 ```
 
-如果后端部署地址发生变化，需要同步修改这里。
+前端会自动在 `backendUrl` 后拼接 `/api`。如果需要完全自定义 API 前缀，也可以使用：
+
+```js
+window.DEEPFAKE_CONFIG = {
+  apiBaseUrl: 'http://127.0.0.1:8000/api',
+}
+```
+
+后端跨域允许域名通过后端配置文件设置：
+
+- `backend/config.json`
+
+默认值为：
+
+```json
+{
+  "allowed_origins": [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173"
+  ]
+}
+```
+
+如果前端部署到其他地址，请把完整的协议、域名和端口加入 `allowed_origins`，例如 `http://192.168.1.10:5173`。修改配置后需要重启后端服务。
 
 ## 常用检查命令
 
@@ -348,7 +376,8 @@ python -m compileall app
 
 - 后端正在 `127.0.0.1:8000` 运行
 - 前端正在 `127.0.0.1:5173` 运行
-- 前端 `src/api.ts` 中的 API 地址未被改错
+- 前端 `public/config.js` 中的后端地址正确
+- 后端 `config.json` 中的 `allowed_origins` 包含当前前端地址
 
 ### 2. 为什么聊天页没有联网搜索？
 

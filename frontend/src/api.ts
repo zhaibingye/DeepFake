@@ -11,8 +11,7 @@ import type {
   SetupStatus,
   User,
 } from './types'
-
-const API_BASE = 'http://127.0.0.1:8000/api'
+import { API_BASE_URL } from './config'
 
 type RequestOptions = {
   method?: string
@@ -65,7 +64,7 @@ async function responseErrorMessage(response: Response, fallback = '请求失败
 }
 
 async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`, {
+  const response = await fetch(`${API_BASE_URL}${path}`, {
     method: options.method ?? 'GET',
     headers: {
       'Content-Type': 'application/json',
@@ -242,7 +241,7 @@ export const api = {
     onChunk: (chunk: ChatStreamEvent) => void,
     signal?: AbortSignal,
   ) => {
-    const response = await fetch(`${API_BASE}/chat/stream`, {
+    const response = await fetch(`${API_BASE_URL}/chat/stream`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

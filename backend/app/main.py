@@ -4,13 +4,14 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.bootstrap import ensure_tables
+from app.config import get_allowed_origins
 from app.routers import admin, auth, chat, conversations, public
 
 
 app = FastAPI(title="Anthropic Chat Console")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=get_allowed_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
