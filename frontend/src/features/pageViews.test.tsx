@@ -45,6 +45,7 @@ describe('presentational page components', () => {
         effectiveAuthMode="login"
         authUsername=""
         authPassword=""
+        setupPasswordConfirm=""
         authError=""
         loadingAuth={false}
         publicAuthSettings={{ allow_registration: false }}
@@ -53,12 +54,14 @@ describe('presentational page components', () => {
         setAuthMode={vi.fn()}
         setAuthUsername={vi.fn()}
         setAuthPassword={vi.fn()}
+        setSetupPasswordConfirm={vi.fn()}
         onSubmit={vi.fn()}
       />,
     )
 
-    expect(html).toContain('auth-shell')
-    expect(html).toContain('当前还没有管理员账号，请先初始化首个管理员。')
+    expect(html).toContain('setup-shell')
+    expect(html).toContain('创建第一个管理员')
+    expect(html).toContain('确认密码')
     expect(html).toContain('创建管理员并进入')
   })
 

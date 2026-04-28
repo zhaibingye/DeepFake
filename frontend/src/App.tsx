@@ -81,6 +81,7 @@ function App() {
   const [authMode, setAuthMode] = useState<AuthMode>('login')
   const [authUsername, setAuthUsername] = useState('')
   const [authPassword, setAuthPassword] = useState('')
+  const [setupPasswordConfirm, setSetupPasswordConfirm] = useState('')
   const [authError, setAuthError] = useState('')
   const [loadingAuth, setLoadingAuth] = useState(false)
   const [publicAuthSettings, setPublicAuthSettings] = useState<AdminSettings>({ allow_registration: true })
@@ -457,6 +458,21 @@ function App() {
 
   async function handleAuthSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
+    if (setupStatus.needs_admin_setup) {
+      const username = authUsername.trim()
+      if (username.length < 3 || username.length > 32) {
+        setAuthError('用户名需要为 3 到 32 个字符。')
+        return
+      }
+      if (authPassword.length < 6 || authPassword.length > 128) {
+        setAuthError('密码需要为 6 到 128 个字符。')
+        return
+      }
+      if (authPassword !== setupPasswordConfirm) {
+        setAuthError('两次输入的密码不一致。')
+        return
+      }
+    }
     setLoadingAuth(true)
     setAuthError('')
     try {
@@ -471,6 +487,7 @@ function App() {
       setUser(result.user)
       setSetupStatus({ needs_admin_setup: false })
       setAuthPassword('')
+      setSetupPasswordConfirm('')
       navigateTo('chat', true)
     } catch (error) {
       const message = error instanceof Error ? error.message : '认证失败'
@@ -776,6 +793,7 @@ function App() {
           effectiveAuthMode={effectiveAuthMode}
           authUsername={authUsername}
           authPassword={authPassword}
+          setupPasswordConfirm={setupPasswordConfirm}
           authError={authError}
           loadingAuth={loadingAuth}
           publicAuthSettings={publicAuthSettings}
@@ -784,6 +802,7 @@ function App() {
           setAuthMode={setAuthMode}
           setAuthUsername={setAuthUsername}
           setAuthPassword={setAuthPassword}
+          setSetupPasswordConfirm={setSetupPasswordConfirm}
           onSubmit={handleAuthSubmit}
         />
         {dialogState ? <ModalDialog closeDialog={closeDialog} dialogState={dialogState} setDialogState={setDialogState} /> : null}
