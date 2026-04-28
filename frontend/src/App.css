@@ -1,6 +1,7 @@
 :root {
   color: #111827;
   background: #f7f8fa;
+  --chat-column-width: 900px;
 }
 
 * {
@@ -206,8 +207,8 @@ button:focus-visible {
   font-weight: 600;
 }
 
-.auth-form input,
-.admin-form input,
+.auth-form input:not([type='checkbox']),
+.admin-form input:not([type='checkbox']),
 .admin-form select,
 .composer textarea,
 .composer select,
@@ -493,7 +494,7 @@ button:focus-visible {
 }
 
 .chat-content {
-  width: min(100%, 800px);
+  width: min(100%, var(--chat-column-width));
   min-height: 100%;
 }
 
@@ -531,7 +532,7 @@ button:focus-visible {
 .message-stream {
   display: grid;
   gap: 22px;
-  width: min(100%, 760px);
+  width: min(100%, var(--chat-column-width));
   margin: 0 auto;
   padding: 8px 0 164px;
 }
@@ -553,11 +554,15 @@ button:focus-visible {
 }
 
 .message-row.user .message-meta-row {
-  width: min(100%, 300px);
+  width: auto;
+  max-width: min(100%, 300px);
+  flex-direction: row-reverse;
+  justify-content: flex-start;
 }
 
 .message-row.assistant .message-meta-row,
-.message-row.assistant .timeline-list {
+.message-row.assistant .timeline-list,
+.message-row.assistant .message-bubble {
   margin-right: auto;
 }
 
@@ -577,6 +582,19 @@ button:focus-visible {
   justify-content: center;
 }
 
+.message-bubble.assistant {
+  width: 100%;
+  padding: 16px 20px;
+  border-radius: 24px;
+  background: #fff;
+  border: 1px solid rgba(229, 234, 245, 0.96);
+  box-shadow: 0 14px 32px rgba(148, 163, 184, 0.1);
+}
+
+.message-bubble.assistant.streaming {
+  border-color: rgba(207, 216, 238, 0.96);
+}
+
 .message-bubble.user .markdown-body {
   display: flex;
   align-items: center;
@@ -584,12 +602,13 @@ button:focus-visible {
   line-height: 1.65;
 }
 
-.message-bubble.user .markdown-body p {
+.message-bubble.user .markdown-body p,
+.message-bubble.assistant .markdown-body p {
   line-height: 1.65;
 }
 
 .timeline-list {
-  width: min(100%, 720px);
+  width: 100%;
   display: grid;
   gap: 10px;
 }
@@ -608,10 +627,6 @@ button:focus-visible {
 
 .timeline-block.tool {
   background: linear-gradient(180deg, rgba(250, 251, 253, 0.98) 0%, rgba(245, 247, 251, 0.98) 100%);
-}
-
-.timeline-block.answer {
-  background: #ffffff;
 }
 
 .timeline-block.error {
@@ -778,10 +793,10 @@ button:focus-visible {
 .composer {
   display: grid;
   gap: 8px;
-  width: min(100%, 820px);
+  width: min(100%, var(--chat-column-width));
   margin-left: auto;
   margin-right: auto;
-  padding: 6px 10px 8px;
+  padding: 8px 14px 10px;
   border-radius: 30px;
 }
 
@@ -818,7 +833,7 @@ button:focus-visible {
   resize: none;
   min-height: 38px;
   border: 0;
-  padding: 4px 10px 0;
+  padding: 4px 0 0;
   background: transparent;
   font-size: 15px;
   line-height: 1.45;
@@ -838,7 +853,7 @@ button:focus-visible {
 .composer-toolbar {
   justify-content: space-between;
   align-items: center;
-  gap: 10px;
+  gap: 12px;
   flex-wrap: nowrap;
 }
 
@@ -1133,8 +1148,15 @@ button:focus-visible {
   font-weight: 600;
 }
 
-.checkbox-row input {
+.checkbox-row input,
+.provider-option-card input {
   width: auto;
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  accent-color: #6280ff;
 }
 
 .checkbox-card {
@@ -1142,6 +1164,53 @@ button:focus-visible {
   border: 1px solid #e5e7eb;
   border-radius: 18px;
   background: #f8f9fc;
+}
+
+.provider-option-group {
+  display: grid;
+  gap: 12px;
+}
+
+.provider-option-heading {
+  display: grid;
+  gap: 4px;
+}
+
+.provider-option-heading span {
+  font-weight: 700;
+}
+
+.provider-option-heading small {
+  color: #6b7280;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.provider-option-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.provider-option-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 56px;
+  padding: 14px 16px;
+  border: 1px solid #e5e7eb;
+  border-radius: 18px;
+  background: #f8f9fc;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.provider-option-card span {
+  display: block;
+}
+
+.provider-status-option {
+  justify-content: flex-start;
 }
 
 .checkbox-row-inline {
@@ -1182,6 +1251,42 @@ button:focus-visible {
   margin: 0;
   color: #64748b;
   line-height: 1.7;
+}
+
+.search-toggle-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  min-height: 88px;
+  padding: 18px 20px;
+  border: 1px solid #e5e7eb;
+  border-radius: 22px;
+  background: linear-gradient(180deg, #fbfcff 0%, #f8f9fc 100%);
+}
+
+.search-toggle-copy {
+  display: grid;
+  gap: 6px;
+}
+
+.search-toggle-copy strong {
+  font-size: 16px;
+  line-height: 1.45;
+}
+
+.search-toggle-copy span {
+  color: #64748b;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.search-toggle-card input {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+  margin: 0;
+  accent-color: #6280ff;
 }
 
 .provider-row {
@@ -1333,6 +1438,7 @@ button:focus-visible {
   .admin-topbar-actions,
   .admin-section-intro,
   .connection-hint-card,
+  .search-toggle-card,
   .provider-row,
   .provider-actions,
   .composer-toprow {

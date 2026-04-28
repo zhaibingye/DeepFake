@@ -60,12 +60,11 @@ function appendTextDelta(state: TimelineState, partId: string, part: TimelinePar
   }
 
   const nextState = ensurePartStarted(state, part)
-  const currentText = nextState.parts.find((existingPart) => existingPart.id === partId)?.text ?? ''
 
   return applyTimelineEvent(nextState, {
     type: 'timeline_part_delta',
     part_id: partId,
-    delta: { text: `${currentText}${delta}` },
+    delta: { text: delta },
   })
 }
 

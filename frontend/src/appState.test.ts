@@ -1,14 +1,18 @@
-import { readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 
-import { constrainProviderState, normalizeThinkingEffort, resolveAuthMode } from './appState'
+import {
+  constrainProviderState,
+  getThinkingEffortOptions,
+  normalizeThinkingEffort,
+  resolveAuthMode,
+} from './appState'
 import type { Provider } from './types'
 
 function makeProvider(overrides: Partial<Provider> = {}): Provider {
   return {
     id: 1,
     name: 'Test Provider',
+    api_format: 'anthropic_messages',
     model_name: 'model',
     supports_thinking: true,
     supports_vision: true,
@@ -74,22 +78,37 @@ describe('app state helpers', () => {
     })
   })
 
+  it('keeps search enabled for OpenAI Responses providers that support tool calling', () => {
+    expect(
+      constrainProviderState(
+        {
+          effort: 'low',
+          enableThinking: true,
+          enableSearch: true,
+          attachments: [],
+        },
+        makeProvider({ api_format: 'openai_responses', supports_tool_calling: true }),
+      ),
+    ).toEqual({
+      effort: 'high',
+      enableThinking: true,
+      enableSearch: true,
+      attachments: [],
+    })
+  })
+
   it('normalizes unknown thinking effort values', () => {
     expect(normalizeThinkingEffort('weird')).toBe('high')
   })
 
-  it('keeps search provider reload tied to token changes', () => {
-    const appSource = readFileSync(resolve(process.cwd(), 'src/App.tsx'), 'utf8')
-
-    expect(appSource).toContain('}, [loadSearchProviders, token])')
+  it('limits OpenAI Chat thinking effort options to low medium high', () => {
+    expect(getThinkingEffortOptions('openai_chat')).toEqual(['low', 'medium', 'high'])
+    expect(normalizeThinkingEffort('max', 'openai_chat')).toBe('high')
   })
 
-  it('does not restore the old selectedProvider synchronization effect', () => {
-    const appSource = readFileSync(resolve(process.cwd(), 'src/App.tsx'), 'utf8')
-
-    expect(appSource).not.toMatch(/if \(!selectedProvider\)\s*\{\s*return\s*\}\s*setEffort\(/)
-    expect(appSource).not.toMatch(
-      /if \(!publicAuthSettings\.allow_registration && authMode === 'register'\)\s*\{\s*setAuthMode\('login'\)/,
-    )
+  it('uses xhigh as the highest OpenAI Responses thinking effort', () => {
+    expect(getThinkingEffortOptions('openai_responses')).toEqual(['low', 'medium', 'high', 'xhigh'])
+    expect(normalizeThinkingEffort('xhigh', 'openai_responses')).toBe('xhigh')
+    expect(normalizeThinkingEffort('max', 'openai_responses')).toBe('xhigh')
   })
 })

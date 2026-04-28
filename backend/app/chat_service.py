@@ -11,12 +11,18 @@ import httpx
 from fastapi import HTTPException
 
 from app.auth import utcnow
+from app.conversation_service import parse_message
 from app.db import get_conn
+from app.provider_client import (
+    apply_provider_thinking_config,
+    normalize_provider_thinking_effort,
+    ProviderRuntimeState,
+    provider_supports_native_tool_calling,
+)
+from app.settings_service import get_exa_config, get_tavily_config
 from app.timeline import (
     answer_text_from_parts,
-    assistant_content_from_row,
     create_part,
-    message_parts_from_row,
     serialize_parts,
 )
 
@@ -42,23 +48,7 @@ class ChatStreamContext:
     pending_user_content_json: str | None
     created_at: str
     request_payload: dict[str, Any]
-
-
-def parse_message(row: sqlite3.Row) -> dict[str, Any]:
-    content = row["content_text"]
-    if row["role"] != "assistant" and row["content_json"]:
-        content = json.loads(row["content_json"])
-    message = {
-        "id": row["id"],
-        "role": row["role"],
-        "content": content,
-        "thinking_text": row["thinking_text"] or "",
-        "created_at": row["created_at"],
-    }
-    if row["role"] == "assistant":
-        message["content"] = assistant_content_from_row(row)
-        message["parts"] = message_parts_from_row(row)
-    return message
+    provider_runtime_state: ProviderRuntimeState
 
 
 def fetch_provider(provider_id: int, include_disabled: bool = False) -> sqlite3.Row:
@@ -150,10 +140,14 @@ def build_chat_request_payload(
         "messages": history,
     }
     if payload.enable_thinking and provider["supports_thinking"]:
-        request_payload["thinking"] = {"type": "adaptive"}
-        request_payload["output_config"] = {
-            "effort": payload.effort or provider["thinking_effort"]
-        }
+        thinking_effort = (
+            str(payload.effort or provider["thinking_effort"]).strip() or "high"
+        )
+        apply_provider_thinking_config(
+            provider,
+            request_payload,
+            normalize_provider_thinking_effort(provider, thinking_effort),
+        )
     if selected_tool:
         request_payload["tools"] = [selected_tool]
     if stream:
@@ -161,42 +155,21 @@ def build_chat_request_payload(
     return request_payload
 
 
-def append_tool_result_message(
-    request_payload: dict[str, Any],
-    assistant_tool_uses: list[dict[str, Any]],
-    tool_results: list[dict[str, Any]],
-) -> None:
-    request_payload["messages"].append(
-        {
-            "role": "assistant",
-            "content": list(assistant_tool_uses),
-        }
-    )
-    request_payload["messages"].append(
-        {
-            "role": "user",
-            "content": tool_results,
-        }
-    )
-
-
-def provider_supports_tool_calling(provider: sqlite3.Row) -> bool:
-    return bool(provider["supports_tool_calling"])
-
-
 def selected_search_tool_schema(
     payload: Any, provider: sqlite3.Row
 ) -> dict[str, Any] | None:
     if not getattr(payload, "enable_search", False):
         return None
-    if not provider_supports_tool_calling(provider):
+    if not provider_supports_native_tool_calling(provider):
         raise SearchProviderUnavailableError("当前模型不支持原生工具调用，无法开启联网搜索")
     if payload.search_provider == "exa":
         from app.tool_runtime import search_tool_schema
 
+        config = get_exa_config()
+        if not config["is_enabled"]:
+            raise SearchProviderUnavailableError("Exa 搜索当前不可用")
         return search_tool_schema("exa")
     if payload.search_provider == "tavily":
-        from app.main import get_tavily_config
         from app.tool_runtime import search_tool_schema
 
         config = get_tavily_config()
@@ -422,11 +395,17 @@ def normalize_search_result(tool_label: str, result: Any) -> dict[str, str]:
 def run_exa_search(query: str) -> dict[str, str]:
     from app.tool_runtime import execute_native_search_tool
 
-    return execute_native_search_tool("exa", {"query": query})
+    config = get_exa_config()
+    if not config.get("is_enabled"):
+        raise RuntimeError("Exa 搜索当前不可用")
+    return execute_native_search_tool(
+        "exa",
+        {"query": query},
+        exa_api_key=config.get("api_key", "").strip(),
+    )
 
 
 def run_tavily_search(query: str) -> dict[str, str]:
-    from app.main import get_tavily_config
     from app.tool_runtime import execute_native_search_tool
 
     config = get_tavily_config()
@@ -509,6 +488,7 @@ def prepare_stream_chat(payload: Any, user: dict[str, Any]) -> ChatStreamContext
         pending_user_content_json=pending_user_content_json,
         created_at=now,
         request_payload=request_payload,
+        provider_runtime_state=ProviderRuntimeState(),
     )
 
 

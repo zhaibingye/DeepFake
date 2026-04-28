@@ -7,6 +7,7 @@ import type {
   Message,
   Provider,
   SearchProviderAvailability,
+  SearchProviderKind,
   SetupStatus,
   User,
 } from './types'
@@ -17,6 +18,50 @@ type RequestOptions = {
   method?: string
   token?: string | null
   body?: unknown
+}
+
+type ValidationErrorItem = {
+  loc?: Array<string | number>
+  msg?: string
+  type?: string
+}
+
+function isValidationErrorItem(value: unknown): value is ValidationErrorItem {
+  if (!value || typeof value !== 'object') return false
+  const item = value as ValidationErrorItem
+  return Array.isArray(item.loc) || typeof item.msg === 'string' || typeof item.type === 'string'
+}
+
+export function formatApiErrorDetail(detail: unknown, fallback = '请求失败'): string {
+  if (typeof detail === 'string') return detail || fallback
+  if (Array.isArray(detail)) {
+    const messages = detail.map((item) => {
+      if (!isValidationErrorItem(item)) return typeof item === 'string' ? item : JSON.stringify(item)
+      const field = item.loc?.filter((part) => part !== 'body').join('.')
+      return [field, item.msg].filter(Boolean).join(': ') || item.type || JSON.stringify(item)
+    })
+    return messages.filter(Boolean).join('\n') || fallback
+  }
+  if (detail && typeof detail === 'object') {
+    return JSON.stringify(detail)
+  }
+  return fallback
+}
+
+async function responseErrorMessage(response: Response, fallback = '请求失败'): Promise<string> {
+  let text = ''
+  try {
+    text = await response.text()
+  } catch {
+    return fallback
+  }
+  if (!text) return fallback
+  try {
+    const data = JSON.parse(text) as { detail?: unknown }
+    return formatApiErrorDetail(data.detail, fallback)
+  } catch {
+    return text
+  }
 }
 
 async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
@@ -30,14 +75,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   })
 
   if (!response.ok) {
-    let detail = '请求失败'
-    try {
-      const data = await response.json()
-      detail = data.detail ?? detail
-    } catch {
-      detail = await response.text()
-    }
-    throw new Error(detail)
+    throw new Error(await responseErrorMessage(response))
   }
 
   if (response.status === 204) {
@@ -128,11 +166,19 @@ export const api = {
   logout: (token: string) => request<{ status: string }>('/auth/logout', { method: 'POST', token }),
   listProviders: (token: string) => request<Provider[]>('/providers', { token }),
   listSearchProviders: () => request<SearchProviderAvailability>('/search-providers'),
+  listAdminSearchProviders: (token: string) =>
+    request<SearchProviderAvailability>('/admin/search-providers', { token }),
+  updateAdminSearchProvider: (
+    token: string,
+    kind: SearchProviderKind,
+    body: { api_key: string; is_enabled: boolean },
+  ) => request<SearchProviderAvailability[SearchProviderKind]>(`/admin/search-providers/${kind}`, { method: 'PUT', token, body }),
   listAdminProviders: (token: string) => request<Provider[]>('/admin/providers', { token }),
   createProvider: (
     token: string,
     body: {
       name: string
+      api_format: string
       api_url: string
       api_key: string
       model_name: string
@@ -150,6 +196,7 @@ export const api = {
     providerId: number,
     body: {
       name: string
+      api_format: string
       api_url: string
       api_key: string
       model_name: string
@@ -206,14 +253,7 @@ export const api = {
     })
 
     if (!response.ok) {
-      let detail = '请求失败'
-      try {
-        const data = await response.json()
-        detail = data.detail ?? detail
-      } catch {
-        detail = await response.text()
-      }
-      throw new Error(detail)
+      throw new Error(await responseErrorMessage(response))
     }
 
     await parseNdjsonStream<ChatStreamEvent>(response, (chunk) => onChunk(normalizeChatStreamEvent(chunk)))

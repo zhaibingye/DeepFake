@@ -1,5 +1,3 @@
-import { readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
@@ -87,7 +85,7 @@ describe('timeline helpers', () => {
     expect(toRenderableTimeline(message).map((part) => part.kind)).toEqual(['thinking', 'answer'])
   })
 
-  it('renders historical answer parts expanded by default', () => {
+  it('renders historical answer parts as assistant message bubbles', () => {
     const markup = renderToStaticMarkup(
       createElement(TimelineList, {
         parts: [
@@ -97,7 +95,8 @@ describe('timeline helpers', () => {
       }),
     )
 
-    expect(markup).toMatch(/<details[^>]*class="timeline-block answer done"[^>]*open=""[^>]*>/)
+    expect(markup).toContain('class="message-bubble assistant"')
+    expect(markup).toContain('最终回答')
     expect(markup).not.toMatch(/<details[^>]*class="timeline-block thinking done"[^>]*open=""[^>]*>/)
   })
 
@@ -186,16 +185,34 @@ describe('timeline helpers', () => {
     expect(state.expandedById['answer-1']).toBe(true)
   })
 
-  it('keeps legacy stream events out of app dispatch logic', () => {
-    const appSource = readFileSync(resolve(process.cwd(), 'src/App.tsx'), 'utf8')
+  it('appends streamed text deltas instead of replacing previous text', () => {
+    let state: TimelineState = {
+      parts: [{ id: 'answer-1', kind: 'answer', status: 'running', text: '' }],
+      expandedById: { 'answer-1': true },
+      manuallyExpanded: {},
+    }
 
-    expect(appSource).toContain("chunk.type === 'timeline_part_start'")
-    expect(appSource).toContain("chunk.type === 'timeline_part_delta'")
-    expect(appSource).toContain("chunk.type === 'timeline_part_end'")
-    expect(appSource).toContain("chunk.type === 'timeline_part_error'")
-    expect(appSource).not.toContain("chunk.type === 'thinking_delta'")
-    expect(appSource).not.toContain("chunk.type === 'text_delta'")
-    expect(appSource).not.toContain("chunk.type === 'activity'")
+    state = reduceTimelineState(state, {
+      type: 'timeline_part_delta',
+      part_id: 'answer-1',
+      delta: { text: '第一段' },
+    })
+    state = reduceTimelineState(state, {
+      type: 'timeline_part_delta',
+      part_id: 'answer-1',
+      delta: { text: '，第二段' },
+    })
+
+    expect(state.parts.find((part) => part.id === 'answer-1')?.text).toBe('第一段，第二段')
+  })
+
+  it('keeps legacy text delta compatibility with append semantics', () => {
+    let state: TimelineState = { parts: [], expandedById: {}, manuallyExpanded: {} }
+
+    state = reduceTimelineState(state, { type: 'text_delta', delta: '旧' })
+    state = reduceTimelineState(state, { type: 'text_delta', delta: '流式' })
+
+    expect(state.parts.find((part) => part.id === 'legacy-answer')?.text).toBe('旧流式')
   })
 
   it('extracts answer text from timeline parts content', () => {

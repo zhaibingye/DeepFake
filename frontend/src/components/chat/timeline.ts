@@ -62,7 +62,14 @@ export function applyTimelineEvent(state: TimelineState, event: ChatStreamEvent)
   if (event.type === 'timeline_part_delta') {
     return {
       ...state,
-      parts: state.parts.map((part) => (part.id === event.part_id ? { ...part, ...event.delta } : part)),
+      parts: state.parts.map((part) => {
+        if (part.id !== event.part_id) return part
+        const nextPart = { ...part, ...event.delta }
+        if (typeof event.delta.text === 'string') {
+          nextPart.text = `${part.text ?? ''}${event.delta.text}`
+        }
+        return nextPart
+      }),
     }
   }
 

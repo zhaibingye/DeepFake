@@ -24,6 +24,7 @@ venv/
 
 # Backend runtime data
 backend/data/
+backend/.test-data/
 backend/*.log
 backend/*.err
 *.db

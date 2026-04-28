@@ -42,16 +42,21 @@ def search_tool_schema(kind: str) -> dict[str, Any]:
 def execute_native_search_tool(
     kind: str,
     arguments: dict[str, Any],
+    exa_api_key: str = "",
     tavily_api_key: str = "",
 ) -> dict[str, str]:
     query = normalize_search_query(str(arguments.get("query", "")))
     if kind == "exa":
+        headers: dict[str, str] | None = None
+        if exa_api_key:
+            headers = {"x-api-key": exa_api_key}
         return normalize_search_result(
             "Exa 搜索",
             call_remote_mcp_tool(
                 EXA_REMOTE_MCP_URL,
                 "web_search_exa",
                 {"query": query},
+                headers=headers,
             ),
         )
     if kind == "tavily":

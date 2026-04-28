@@ -1,4 +1,5 @@
-export type ThinkingEffort = 'low' | 'medium' | 'high' | 'max'
+export type ThinkingEffort = 'low' | 'medium' | 'high' | 'max' | 'xhigh'
+export type ProviderApiFormat = 'anthropic_messages' | 'openai_chat' | 'openai_responses' | 'gemini'
 
 export type User = {
   id: number
@@ -26,6 +27,7 @@ export type SetupStatus = {
 export type Provider = {
   id: number
   name: string
+  api_format: ProviderApiFormat
   model_name: string
   supports_thinking: boolean
   supports_vision: boolean
@@ -48,8 +50,11 @@ export type Attachment = {
 export type SearchProviderKind = 'exa' | 'tavily'
 
 export type SearchProviderStatus = {
+  kind?: SearchProviderKind
+  name?: string
   is_enabled: boolean
   is_configured: boolean
+  api_key_masked?: string
 }
 
 export type SearchProviderAvailability = Record<SearchProviderKind, SearchProviderStatus>
