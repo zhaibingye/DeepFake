@@ -1,5 +1,5 @@
 export type ThinkingEffort = 'low' | 'medium' | 'high' | 'max' | 'xhigh'
-export type ProviderApiFormat = 'anthropic_messages' | 'openai_chat' | 'openai_responses' | 'gemini'
+export type ProviderApiFormat = 'anthropic_messages' | 'openai_chat' | 'deepseek_chat' | 'siliconflow_chat' | 'openai_responses' | 'gemini'
 
 export type User = {
   id: number

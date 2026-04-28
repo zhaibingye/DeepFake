@@ -21,6 +21,14 @@ def normalize_provider_thinking_effort(
     api_format: str, thinking_effort: str
 ) -> str:
     normalized = thinking_effort.strip() or "high"
+    if api_format == "deepseek_chat":
+        if normalized in {"low", "medium"}:
+            return "high"
+        if normalized == "xhigh":
+            return "max"
+        return normalized if normalized in {"high", "max"} else "high"
+    if api_format == "siliconflow_chat":
+        return normalized if normalized in {"low", "medium", "high"} else "high"
     if api_format == "openai_chat" and normalized == "max":
         return "high"
     if api_format == "openai_chat" and normalized == "xhigh":

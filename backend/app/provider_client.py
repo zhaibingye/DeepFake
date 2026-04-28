@@ -14,6 +14,12 @@ OPENAI_CHAT_THINKING_BUDGETS = {
     "medium": 16000,
     "high": 32000,
 }
+DEEPSEEK_THINKING_EFFORTS = {"high", "max"}
+SILICONFLOW_THINKING_BUDGETS = {
+    "low": 8000,
+    "medium": 16000,
+    "high": 32000,
+}
 
 
 def _require_valid_base_url(api_url: str) -> str:
@@ -181,15 +187,17 @@ def _to_openai_messages(api_format: str, messages: object) -> list[dict[str, obj
         if not isinstance(message, dict):
             continue
         role = str(message.get("role", "user"))
-        if api_format == "openai_chat":
+        if api_format in {"openai_chat", "deepseek_chat", "siliconflow_chat"}:
             if role == "assistant" and isinstance(message.get("tool_calls"), list):
-                openai_messages.append(
-                    {
-                        "role": "assistant",
-                        "content": str(message.get("content", "")),
-                        "tool_calls": message.get("tool_calls", []),
-                    }
-                )
+                assistant_message: dict[str, object] = {
+                    "role": "assistant",
+                    "content": str(message.get("content", "")),
+                    "tool_calls": message.get("tool_calls", []),
+                }
+                reasoning_content = message.get("reasoning_content")
+                if api_format in {"deepseek_chat", "siliconflow_chat"} and isinstance(reasoning_content, str):
+                    assistant_message["reasoning_content"] = reasoning_content
+                openai_messages.append(assistant_message)
                 continue
             if role == "tool":
                 openai_messages.append(
@@ -343,6 +351,7 @@ class GatewayState:
     response_output_items: list[dict[str, object]] | None = None
     response_output_item_keys: set[str] | None = None
     active_block_kinds: dict[int, str] | None = None
+    deepseek_reasoning_chunks: list[str] | None = None
 
     def __post_init__(self) -> None:
         if self.active_tool_indexes is None:
@@ -357,6 +366,8 @@ class GatewayState:
             self.response_output_item_keys = set()
         if self.active_block_kinds is None:
             self.active_block_kinds = {}
+        if self.deepseek_reasoning_chunks is None:
+            self.deepseek_reasoning_chunks = []
 
 
 @dataclass(slots=True)
@@ -365,6 +376,7 @@ class ProviderRuntimeState:
     responses_input_history: list[dict[str, object]] | None = None
     responses_output_items: list[dict[str, object]] = field(default_factory=list)
     gemini_contents: list[dict[str, object]] | None = None
+    deepseek_reasoning_content: str = ""
 
 
 class ProviderAdapter:
@@ -673,6 +685,264 @@ class OpenAIChatAdapter(ProviderAdapter):
             state.text_block_open = False
             return [{"type": "text_end", "index": 0}]
         return []
+
+
+class DeepSeekChatAdapter(OpenAIChatAdapter):
+    api_format = "deepseek_chat"
+
+    def build_payload(self, provider, payload: dict[str, object]) -> dict[str, object]:
+        request_payload: dict[str, object] = {
+            "model": payload.get("model"),
+            "messages": _to_openai_messages(self.api_format, payload.get("messages", [])),
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        thinking = payload.get("thinking")
+        if isinstance(thinking, dict):
+            request_payload["thinking"] = {
+                "type": "enabled",
+                "reasoning_effort": self.normalize_thinking_effort(
+                    str(thinking.get("reasoning_effort") or thinking.get("effort") or "high")
+                ),
+            }
+        else:
+            request_payload["thinking"] = {"type": "disabled"}
+        openai_tools = _to_openai_tools(payload.get("tools"))
+        if openai_tools:
+            request_payload["tools"] = openai_tools
+            request_payload["tool_choice"] = "auto"
+        if "max_tokens" in payload:
+            request_payload["max_tokens"] = payload["max_tokens"]
+        return request_payload
+
+    def normalize_thinking_effort(self, effort: str) -> str:
+        normalized = effort.strip() or "high"
+        if normalized in {"low", "medium"}:
+            return "high"
+        if normalized == "xhigh":
+            return "max"
+        return normalized if normalized in DEEPSEEK_THINKING_EFFORTS else "high"
+
+    def apply_thinking_config(
+        self,
+        request_payload: dict[str, object],
+        effort: str,
+    ) -> None:
+        request_payload["thinking"] = {
+            "type": "enabled",
+            "reasoning_effort": self.normalize_thinking_effort(effort),
+        }
+
+    def append_tool_result_messages(
+        self,
+        request_payload: dict[str, object],
+        assistant_tool_uses: list[dict[str, object]],
+        tool_results: list[dict[str, object]],
+        runtime_state: ProviderRuntimeState,
+    ) -> None:
+        assistant_message: dict[str, object] = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": str(tool_use["id"]),
+                    "type": "function",
+                    "function": {
+                        "name": str(tool_use["name"]),
+                        "arguments": json.dumps(
+                            tool_use.get("input", {}),
+                            ensure_ascii=False,
+                        ),
+                    },
+                }
+                for tool_use in assistant_tool_uses
+            ],
+        }
+        if runtime_state.deepseek_reasoning_content:
+            assistant_message["reasoning_content"] = runtime_state.deepseek_reasoning_content
+        request_payload["messages"].append(assistant_message)
+        request_payload["messages"].extend(
+            {
+                "role": "tool",
+                "tool_call_id": str(tool_result["tool_use_id"]),
+                "content": str(tool_result["content"]),
+            }
+            for tool_result in tool_results
+        )
+        runtime_state.deepseek_reasoning_content = ""
+
+    def convert_gateway_event(
+        self,
+        payload: dict[str, object],
+        *,
+        state: GatewayState,
+    ) -> list[dict[str, object]]:
+        output: list[dict[str, object]] = []
+        usage = payload.get("usage")
+        if isinstance(usage, dict):
+            output.append({"type": "usage", "usage": usage})
+
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return output
+        choice = choices[0]
+        if not isinstance(choice, dict):
+            return output
+
+        delta = choice.get("delta", {})
+        finish_reason = choice.get("finish_reason")
+        if isinstance(delta, dict):
+            reasoning = delta.get("reasoning_content")
+            text = delta.get("content")
+            tool_calls = delta.get("tool_calls")
+
+            if isinstance(reasoning, str) and reasoning:
+                if state.deepseek_reasoning_chunks is not None:
+                    state.deepseek_reasoning_chunks.append(reasoning)
+                if not state.thinking_block_open:
+                    output.append({"type": "reasoning_start", "index": 1})
+                    state.thinking_block_open = True
+                output.append({"type": "reasoning_delta", "index": 1, "text": reasoning})
+
+            if isinstance(text, str) and text:
+                if state.thinking_block_open:
+                    output.append({"type": "reasoning_end", "index": 1})
+                    state.thinking_block_open = False
+                if not state.text_block_open:
+                    output.append({"type": "text_start", "index": 0})
+                    state.text_block_open = True
+                output.append({"type": "text_delta", "index": 0, "text": text})
+
+            if isinstance(tool_calls, list) and tool_calls:
+                if state.thinking_block_open:
+                    output.append({"type": "reasoning_end", "index": 1})
+                    state.thinking_block_open = False
+                if state.text_block_open:
+                    output.append({"type": "text_end", "index": 0})
+                    state.text_block_open = False
+                output.extend(self._convert_deepseek_tool_call_deltas(tool_calls, state))
+
+        if finish_reason is not None:
+            if finish_reason == "tool_calls":
+                for tool_index in sorted(state.active_tool_indexes):
+                    output.append({"type": "tool_call_end", "index": tool_index})
+                state.active_tool_indexes.clear()
+                return output
+            if state.thinking_block_open:
+                output.append({"type": "reasoning_end", "index": 1})
+                state.thinking_block_open = False
+            if state.text_block_open:
+                output.append({"type": "text_end", "index": 0})
+                state.text_block_open = False
+            output.append({"type": "turn_end"})
+        return output
+
+    def _convert_deepseek_tool_call_deltas(
+        self,
+        tool_calls: list[object],
+        state: GatewayState,
+    ) -> list[dict[str, object]]:
+        output: list[dict[str, object]] = []
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            tool_index = tool_call.get("index", 0)
+            if not isinstance(tool_index, int):
+                tool_index = 0
+            internal_index = tool_index + 100
+            tool_id = str(tool_call.get("id") or f"tool-call-{tool_index}")
+            function_payload = tool_call.get("function", {})
+            function_name = ""
+            partial_arguments = ""
+            if isinstance(function_payload, dict):
+                raw_name = function_payload.get("name")
+                if isinstance(raw_name, str):
+                    function_name = raw_name
+                raw_arguments = function_payload.get("arguments")
+                if isinstance(raw_arguments, str):
+                    partial_arguments = raw_arguments
+            if function_name and internal_index not in state.active_tool_indexes:
+                output.append(
+                    {
+                        "type": "tool_call_start",
+                        "index": internal_index,
+                        "id": tool_id,
+                        "name": function_name,
+                        "input": {},
+                    }
+                )
+                state.active_tool_indexes.add(internal_index)
+            if partial_arguments:
+                output.append(
+                    {
+                        "type": "tool_call_delta",
+                        "index": internal_index,
+                        "partial_json": partial_arguments,
+                    }
+                )
+        return output
+
+    def finalize_gateway_events(self, state: GatewayState) -> list[dict[str, object]]:
+        output: list[dict[str, object]] = []
+        if state.thinking_block_open:
+            output.append({"type": "reasoning_end", "index": 1})
+            state.thinking_block_open = False
+        if state.text_block_open:
+            output.append({"type": "text_end", "index": 0})
+            state.text_block_open = False
+        return output
+
+    def export_stream_state(
+        self,
+        payload: dict[str, object],
+        state: GatewayState,
+        runtime_state: ProviderRuntimeState | None = None,
+    ) -> None:
+        if runtime_state is not None and state.deepseek_reasoning_chunks is not None:
+            runtime_state.deepseek_reasoning_content = "".join(
+                state.deepseek_reasoning_chunks
+            )
+
+
+class SiliconFlowChatAdapter(DeepSeekChatAdapter):
+    api_format = "siliconflow_chat"
+
+    def build_payload(self, provider, payload: dict[str, object]) -> dict[str, object]:
+        request_payload: dict[str, object] = {
+            "model": payload.get("model"),
+            "messages": _to_openai_messages(self.api_format, payload.get("messages", [])),
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        if payload.get("enable_thinking") is True:
+            raw_budget = payload.get("thinking_budget")
+            budget = raw_budget if isinstance(raw_budget, int) else SILICONFLOW_THINKING_BUDGETS["high"]
+            request_payload["enable_thinking"] = True
+            request_payload["thinking_budget"] = min(32768, max(128, budget))
+        else:
+            request_payload["enable_thinking"] = False
+
+        openai_tools = _to_openai_tools(payload.get("tools"))
+        if openai_tools:
+            request_payload["tools"] = openai_tools
+            request_payload["tool_choice"] = "auto"
+        if "max_tokens" in payload:
+            request_payload["max_tokens"] = payload["max_tokens"]
+        return request_payload
+
+    def normalize_thinking_effort(self, effort: str) -> str:
+        normalized = effort.strip() or "high"
+        return normalized if normalized in SILICONFLOW_THINKING_BUDGETS else "high"
+
+    def apply_thinking_config(
+        self,
+        request_payload: dict[str, object],
+        effort: str,
+    ) -> None:
+        request_payload["enable_thinking"] = True
+        request_payload["thinking_budget"] = SILICONFLOW_THINKING_BUDGETS[
+            self.normalize_thinking_effort(effort)
+        ]
 
 
 class OpenAIResponsesAdapter(ProviderAdapter):
@@ -1177,6 +1447,8 @@ class GeminiAdapter(ProviderAdapter):
 ADAPTERS: dict[str, ProviderAdapter] = {
     "anthropic_messages": AnthropicMessagesAdapter(),
     "openai_chat": OpenAIChatAdapter(),
+    "deepseek_chat": DeepSeekChatAdapter(),
+    "siliconflow_chat": SiliconFlowChatAdapter(),
     "openai_responses": OpenAIResponsesAdapter(),
     "gemini": GeminiAdapter(),
 }

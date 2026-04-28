@@ -4,15 +4,22 @@ export type AuthMode = 'login' | 'register'
 
 export const standardThinkingEffortOptions: ThinkingEffort[] = ['low', 'medium', 'high', 'max']
 export const openAiChatThinkingEffortOptions: ThinkingEffort[] = ['low', 'medium', 'high']
+export const deepSeekThinkingEffortOptions: ThinkingEffort[] = ['high', 'max']
+export const siliconFlowThinkingEffortOptions: ThinkingEffort[] = ['low', 'medium', 'high']
 export const openAiResponsesThinkingEffortOptions: ThinkingEffort[] = ['low', 'medium', 'high', 'xhigh']
 
 export function getThinkingEffortOptions(apiFormat?: ProviderApiFormat): ThinkingEffort[] {
   if (apiFormat === 'openai_chat') return openAiChatThinkingEffortOptions
+  if (apiFormat === 'deepseek_chat') return deepSeekThinkingEffortOptions
+  if (apiFormat === 'siliconflow_chat') return siliconFlowThinkingEffortOptions
   if (apiFormat === 'openai_responses') return openAiResponsesThinkingEffortOptions
   return standardThinkingEffortOptions
 }
 
 export function normalizeThinkingEffort(effort: string, apiFormat?: ProviderApiFormat): ThinkingEffort {
+  if (apiFormat === 'deepseek_chat' && (effort === 'low' || effort === 'medium')) return 'high'
+  if (apiFormat === 'deepseek_chat' && effort === 'xhigh') return 'max'
+  if (apiFormat === 'siliconflow_chat' && (effort === 'max' || effort === 'xhigh')) return 'high'
   if (apiFormat === 'openai_chat' && effort === 'max') return 'high'
   if (apiFormat === 'openai_chat' && effort === 'xhigh') return 'high'
   if (apiFormat === 'openai_responses' && effort === 'max') return 'xhigh'
@@ -46,6 +53,8 @@ export function constrainProviderState(
     && (
       provider.api_format === 'anthropic_messages'
       || provider.api_format === 'openai_chat'
+      || provider.api_format === 'deepseek_chat'
+      || provider.api_format === 'siliconflow_chat'
       || provider.api_format === 'openai_responses'
       || provider.api_format === 'gemini'
     )

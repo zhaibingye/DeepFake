@@ -10,6 +10,7 @@ import type {
 } from '../../types'
 import type { ProviderFormState } from './providerForm'
 import type { SearchProviderFormState } from './controller'
+import { normalizeThinkingEffort } from '../../appState'
 import { formatDateTime } from '../../utils'
 
 export type AdminSection = 'overview' | 'providers' | 'search-mcp' | 'users'
@@ -32,6 +33,8 @@ const providerCapabilities: ReadonlyArray<{
 const providerApiFormatLabels: Record<ProviderApiFormat, string> = {
   anthropic_messages: 'Anthropic Messages',
   openai_chat: 'OpenAI Chat',
+  deepseek_chat: 'DeepSeek Chat',
+  siliconflow_chat: 'SiliconFlow Chat',
   openai_responses: 'OpenAI Responses',
   gemini: 'Gemini',
 }
@@ -298,19 +301,14 @@ export function AdminPage({
                         setProviderForm((prev) => ({
                           ...prev,
                           api_format: apiFormat,
-                          thinking_effort:
-                            apiFormat === 'openai_chat' && (prev.thinking_effort === 'max' || prev.thinking_effort === 'xhigh')
-                              ? 'high'
-                              : apiFormat === 'openai_responses' && prev.thinking_effort === 'max'
-                                ? 'xhigh'
-                                : apiFormat !== 'openai_responses' && prev.thinking_effort === 'xhigh'
-                                  ? 'max'
-                                  : prev.thinking_effort,
+                          thinking_effort: normalizeThinkingEffort(prev.thinking_effort, apiFormat),
                         }))
                       }}
                     >
                       <option value="anthropic_messages">Anthropic Messages</option>
                       <option value="openai_chat">OpenAI Chat Completions</option>
+                      <option value="deepseek_chat">DeepSeek Chat Completions</option>
+                      <option value="siliconflow_chat">SiliconFlow Chat Completions</option>
                       <option value="openai_responses">OpenAI Responses</option>
                       <option value="gemini">Gemini</option>
                     </select>

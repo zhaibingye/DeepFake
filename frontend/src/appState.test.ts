@@ -97,6 +97,25 @@ describe('app state helpers', () => {
     })
   })
 
+  it('keeps search enabled for SiliconFlow Chat providers that support tool calling', () => {
+    expect(
+      constrainProviderState(
+        {
+          effort: 'low',
+          enableThinking: true,
+          enableSearch: true,
+          attachments: [],
+        },
+        makeProvider({ api_format: 'siliconflow_chat', supports_tool_calling: true }),
+      ),
+    ).toEqual({
+      effort: 'high',
+      enableThinking: true,
+      enableSearch: true,
+      attachments: [],
+    })
+  })
+
   it('normalizes unknown thinking effort values', () => {
     expect(normalizeThinkingEffort('weird')).toBe('high')
   })
@@ -110,5 +129,19 @@ describe('app state helpers', () => {
     expect(getThinkingEffortOptions('openai_responses')).toEqual(['low', 'medium', 'high', 'xhigh'])
     expect(normalizeThinkingEffort('xhigh', 'openai_responses')).toBe('xhigh')
     expect(normalizeThinkingEffort('max', 'openai_responses')).toBe('xhigh')
+  })
+
+  it('limits DeepSeek thinking effort options to high and max', () => {
+    expect(getThinkingEffortOptions('deepseek_chat')).toEqual(['high', 'max'])
+    expect(normalizeThinkingEffort('low', 'deepseek_chat')).toBe('high')
+    expect(normalizeThinkingEffort('xhigh', 'deepseek_chat')).toBe('max')
+    expect(normalizeThinkingEffort('max', 'deepseek_chat')).toBe('max')
+  })
+
+  it('limits SiliconFlow thinking effort options to low medium high', () => {
+    expect(getThinkingEffortOptions('siliconflow_chat')).toEqual(['low', 'medium', 'high'])
+    expect(normalizeThinkingEffort('max', 'siliconflow_chat')).toBe('high')
+    expect(normalizeThinkingEffort('xhigh', 'siliconflow_chat')).toBe('high')
+    expect(normalizeThinkingEffort('weird', 'siliconflow_chat')).toBe('high')
   })
 })

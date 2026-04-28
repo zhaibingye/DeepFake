@@ -46,7 +46,7 @@ class AdminUserPasswordResetPayload(BaseModel):
 
 class ProviderBasePayload(BaseModel):
     name: str = Field(min_length=1, max_length=64)
-    api_format: str = Field(default="anthropic_messages", pattern="^(anthropic_messages|openai_chat|openai_responses|gemini)$")
+    api_format: str = Field(default="anthropic_messages", pattern="^(anthropic_messages|openai_chat|deepseek_chat|siliconflow_chat|openai_responses|gemini)$")
     model_name: str = Field(min_length=1, max_length=128)
     supports_thinking: bool = True
     supports_vision: bool = False

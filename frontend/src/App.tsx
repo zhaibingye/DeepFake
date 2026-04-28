@@ -152,6 +152,8 @@ function App() {
       && (
         selectedProvider.api_format === 'anthropic_messages'
         || selectedProvider.api_format === 'openai_chat'
+        || selectedProvider.api_format === 'deepseek_chat'
+        || selectedProvider.api_format === 'siliconflow_chat'
         || selectedProvider.api_format === 'openai_responses'
         || selectedProvider.api_format === 'gemini'
       ),
@@ -166,9 +168,13 @@ function App() {
   const providerApiUrlPlaceholder =
     providerForm.api_format === 'openai_chat' || providerForm.api_format === 'openai_responses'
       ? 'https://api.openai.com/v1'
-      : providerForm.api_format === 'gemini'
-        ? 'https://generativelanguage.googleapis.com/v1beta'
-        : 'https://.../anthropic/v1'
+      : providerForm.api_format === 'deepseek_chat'
+        ? 'https://api.deepseek.com'
+        : providerForm.api_format === 'siliconflow_chat'
+          ? 'https://api.siliconflow.cn/v1'
+          : providerForm.api_format === 'gemini'
+            ? 'https://generativelanguage.googleapis.com/v1beta'
+            : 'https://.../anthropic/v1'
   const filteredAdminUsers = adminUsers.filter((managedUser) => {
     const keyword = userSearch.trim().toLowerCase()
     if (!keyword) return true
