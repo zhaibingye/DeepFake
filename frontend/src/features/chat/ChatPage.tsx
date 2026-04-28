@@ -83,6 +83,20 @@ type ChatPageProps = {
   setEffort: (value: ThinkingEffort) => void
 }
 
+function renderImageGrid(images: Array<Pick<Attachment, 'media_type' | 'data'>>, keyPrefix: string) {
+  if (!images.length) {
+    return null
+  }
+
+  return (
+    <div className="image-grid">
+      {images.map((image, index) => (
+        <img key={`${keyPrefix}-${index}`} alt="uploaded" src={`data:${image.media_type};base64,${image.data}`} />
+      ))}
+    </div>
+  )
+}
+
 export function ChatPage({
   sidebarCollapsed,
   chatLoading,
@@ -254,11 +268,7 @@ export function ChatPage({
                       <div className="markdown-body">
                         <MarkdownView content={messagePlainText(message.content)} />
                       </div>
-                      <div className="image-grid">
-                        {messageImages(message.content).map((image, index) => (
-                          <img key={`${message.id}-${index}`} alt="uploaded" src={`data:${image.media_type};base64,${image.data}`} />
-                        ))}
-                      </div>
+                      {renderImageGrid(messageImages(message.content), String(message.id))}
                     </div>
                   )}
                 </article>
@@ -273,11 +283,7 @@ export function ChatPage({
                     <div className="markdown-body">
                       <MarkdownView content={pendingUserMessage.text || '[图片消息]'} />
                     </div>
-                    <div className="image-grid">
-                      {pendingUserMessage.attachments.map((image, index) => (
-                        <img key={`pending-${index}`} alt="uploaded" src={`data:${image.media_type};base64,${image.data}`} />
-                      ))}
-                    </div>
+                    {renderImageGrid(pendingUserMessage.attachments, 'pending')}
                   </div>
                 </article>
               ) : null}

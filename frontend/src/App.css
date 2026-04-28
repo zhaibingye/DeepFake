@@ -730,13 +730,14 @@ button:focus-visible {
 
 .message-bubble.user {
   width: auto;
-  max-width: min(100%, 300px);
+  max-width: min(100%, 520px);
   padding: 16px 20px;
   border-radius: 24px;
   background: #edf4ff;
   display: flex;
-  align-items: center;
-  justify-content: center;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: flex-start;
 }
 
 .message-bubble.assistant {
@@ -753,9 +754,8 @@ button:focus-visible {
 }
 
 .message-bubble.user .markdown-body {
-  display: flex;
-  align-items: center;
   min-height: 1.6em;
+  min-width: 0;
   line-height: 1.65;
 }
 
@@ -939,10 +939,14 @@ button:focus-visible {
   flex-wrap: wrap;
   gap: 12px;
   margin-top: 12px;
+  width: 100%;
 }
 
 .image-grid img {
-  width: min(240px, 100%);
+  width: 100%;
+  max-width: 100%;
+  height: auto;
+  display: block;
   border-radius: 18px;
   border: 1px solid #e5e7eb;
 }
