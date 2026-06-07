@@ -36,6 +36,7 @@ def ensure_tables() -> None:
 
             CREATE TABLE IF NOT EXISTS providers (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                connection_id INTEGER,
                 name TEXT NOT NULL,
                 api_format TEXT NOT NULL DEFAULT 'anthropic_messages',
                 api_url TEXT NOT NULL,
@@ -48,6 +49,16 @@ def ensure_tables() -> None:
                 max_context_window INTEGER NOT NULL DEFAULT 256000,
                 max_output_tokens INTEGER NOT NULL DEFAULT 32000,
                 is_enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS provider_connections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                api_format TEXT NOT NULL DEFAULT 'anthropic_messages',
+                api_url TEXT NOT NULL,
+                api_key TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -98,6 +109,32 @@ def ensure_tables() -> None:
         if "api_format" not in provider_columns:
             conn.execute(
                 "ALTER TABLE providers ADD COLUMN api_format TEXT NOT NULL DEFAULT 'anthropic_messages'"
+            )
+        if "connection_id" not in provider_columns:
+            conn.execute("ALTER TABLE providers ADD COLUMN connection_id INTEGER")
+
+        provider_rows = conn.execute(
+            "SELECT * FROM providers WHERE connection_id IS NULL ORDER BY id"
+        ).fetchall()
+        for provider_row in provider_rows:
+            cursor = conn.execute(
+                """
+                INSERT INTO provider_connections (
+                    name, api_format, api_url, api_key, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    provider_row["name"],
+                    provider_row["api_format"],
+                    provider_row["api_url"],
+                    provider_row["api_key"],
+                    provider_row["created_at"],
+                    provider_row["updated_at"],
+                ),
+            )
+            conn.execute(
+                "UPDATE providers SET connection_id = ? WHERE id = ?",
+                (cursor.lastrowid, provider_row["id"]),
             )
 
         default_settings = {

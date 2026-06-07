@@ -19,6 +19,7 @@ from app.provider_client import (
     ProviderRuntimeState,
     provider_supports_native_tool_calling,
 )
+from app.provider_service import PROVIDER_SELECT
 from app.settings_service import get_exa_config, get_tavily_config
 from app.timeline import (
     answer_text_from_parts,
@@ -54,7 +55,7 @@ class ChatStreamContext:
 def fetch_provider(provider_id: int, include_disabled: bool = False) -> sqlite3.Row:
     with closing(get_conn()) as conn:
         row = conn.execute(
-            "SELECT * FROM providers WHERE id = ?", (provider_id,)
+            f"{PROVIDER_SELECT} WHERE p.id = ?", (provider_id,)
         ).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="供应商不存在")
@@ -549,7 +550,15 @@ def commit_stream_chat(
         )
         conn.commit()
         convo = conn.execute(
-            "SELECT conversations.*, providers.name AS provider_name, providers.model_name AS model_name FROM conversations JOIN providers ON providers.id = conversations.provider_id WHERE conversations.id = ?",
+            """
+            SELECT conversations.*,
+                COALESCE(provider_connections.name, providers.name) AS provider_name,
+                providers.model_name AS model_name
+            FROM conversations
+            JOIN providers ON providers.id = conversations.provider_id
+            LEFT JOIN provider_connections ON provider_connections.id = providers.connection_id
+            WHERE conversations.id = ?
+            """,
             (context.conversation_id,),
         ).fetchone()
         rows = conn.execute(

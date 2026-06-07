@@ -56,9 +56,12 @@ def list_conversations_for_user(user_id: int) -> list[dict[str, Any]]:
     with closing(get_conn()) as conn:
         rows = conn.execute(
             """
-            SELECT conversations.*, providers.name AS provider_name, providers.model_name AS model_name
+            SELECT conversations.*,
+                COALESCE(provider_connections.name, providers.name) AS provider_name,
+                providers.model_name AS model_name
             FROM conversations
             JOIN providers ON providers.id = conversations.provider_id
+            LEFT JOIN provider_connections ON provider_connections.id = providers.connection_id
             WHERE conversations.user_id = ?
             ORDER BY conversations.updated_at DESC
             """,
@@ -109,9 +112,12 @@ def rename_conversation_for_user(
         conn.commit()
         updated = conn.execute(
             """
-            SELECT conversations.*, providers.name AS provider_name, providers.model_name AS model_name
+            SELECT conversations.*,
+                COALESCE(provider_connections.name, providers.name) AS provider_name,
+                providers.model_name AS model_name
             FROM conversations
             JOIN providers ON providers.id = conversations.provider_id
+            LEFT JOIN provider_connections ON provider_connections.id = providers.connection_id
             WHERE conversations.id = ?
             """,
             (conversation_id,),

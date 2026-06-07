@@ -39,6 +39,7 @@ import type { SearchProviderLoadState } from './features/chat/searchProviders'
 import { useTimelineState } from './components/chat/useTimelineState.ts'
 import type {
   AdminManagedUser,
+  AdminProviderGroup,
   AdminSettings,
   Attachment,
   ChatDonePayload,
@@ -89,7 +90,7 @@ function App() {
   const [setupStatusLoaded, setSetupStatusLoaded] = useState(false)
 
   const [providers, setProviders] = useState<Provider[]>([])
-  const [adminProviders, setAdminProviders] = useState<Provider[]>([])
+  const [adminProviders, setAdminProviders] = useState<AdminProviderGroup[]>([])
   const [adminSearchProviders, setAdminSearchProviders] = useState<SearchProviderAvailability | null>(null)
   const [adminUsers, setAdminUsers] = useState<AdminManagedUser[]>([])
   const [adminSettings, setAdminSettings] = useState<AdminSettings>({ allow_registration: true })
@@ -646,14 +647,14 @@ function App() {
     })
   }
 
-  async function removeProvider(provider: Provider) {
+  async function removeProvider(provider: AdminProviderGroup) {
     if (!token) return
     await removeProviderState({
       token,
       provider,
       selectedProviderId,
       applyProviderSelection,
-      confirmDelete: () => openConfirmDialog('删除供应商', `确认删除供应商“${provider.name}”吗？`, '删除'),
+      confirmDelete: () => openConfirmDialog('删除供应商', `确认删除供应商“${provider.name}”及其模型配置吗？`, '删除'),
       setProviderError,
       setProviderSuccess,
       refreshAfterDelete: async () => {
@@ -662,7 +663,7 @@ function App() {
     })
   }
 
-  function editProvider(provider: Provider) {
+  function editProvider(provider: AdminProviderGroup) {
     setEditingProviderId(provider.id)
     setProviderForm(buildEditingProviderForm(provider))
     navigateToAdminSection('providers')

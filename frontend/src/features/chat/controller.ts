@@ -242,6 +242,7 @@ export async function sendMessageState(options: {
   loadConversationsForSession: (currentToken: string, sessionVersion: number) => Promise<boolean>
 }) {
   if (!options.selectedProviderId || options.chatLoading) return
+  if (!options.input.trim() && options.attachments.length === 0) return
 
   const sessionVersion = options.authSessionVersionRef.current
   if (options.enableSearch && !options.selectedProviderSupportsToolCalling) {

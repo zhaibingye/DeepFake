@@ -6,7 +6,7 @@ import { AuthPage } from './auth/AuthPage'
 import { ChatPage } from './chat/ChatPage'
 import { defaultProviderForm } from './admin/providerForm'
 import { buildSearchProviderForms } from './admin/controller'
-import type { AdminManagedUser, Conversation, Provider, User } from '../types'
+import type { AdminManagedUser, AdminProviderGroup, Conversation, Provider, User } from '../types'
 
 function makeProvider(overrides: Partial<Provider> = {}): Provider {
   return {
@@ -23,6 +23,21 @@ function makeProvider(overrides: Partial<Provider> = {}): Provider {
     is_enabled: true,
     created_at: '2026-04-23T00:00:00Z',
     updated_at: '2026-04-23T00:00:00Z',
+    ...overrides,
+  }
+}
+
+function makeProviderGroup(overrides: Partial<AdminProviderGroup> = {}): AdminProviderGroup {
+  const provider = makeProvider()
+  return {
+    id: provider.connection_id ?? provider.id,
+    name: provider.name,
+    api_format: provider.api_format,
+    model_count: 1,
+    models: [provider],
+    created_at: provider.created_at,
+    updated_at: provider.updated_at,
+    api_key_masked: 'test-key',
     ...overrides,
   }
 }
@@ -79,7 +94,7 @@ describe('presentational page components', () => {
     const html = renderToStaticMarkup(
       <AdminPage
         adminSection="users"
-        adminProviders={[makeProvider()]}
+        adminProviders={[makeProviderGroup()]}
         adminSearchProviders={{
           exa: { kind: 'exa', name: 'Exa', is_enabled: true, is_configured: true, api_key_masked: '未设置（可选）' },
           tavily: { kind: 'tavily', name: 'Tavily', is_enabled: false, is_configured: false, api_key_masked: '未设置' },
@@ -137,7 +152,7 @@ describe('presentational page components', () => {
     const html = renderToStaticMarkup(
       <AdminPage
         adminSection="providers"
-        adminProviders={[makeProvider()]}
+        adminProviders={[makeProviderGroup()]}
         adminSearchProviders={{
           exa: { kind: 'exa', name: 'Exa', is_enabled: true, is_configured: true, api_key_masked: '未设置（可选）' },
           tavily: { kind: 'tavily', name: 'Tavily', is_enabled: false, is_configured: false, api_key_masked: '未设置' },
@@ -151,7 +166,10 @@ describe('presentational page components', () => {
         userAdminMessage=""
         userAdminError={false}
         editingProviderId={null}
-        providerForm={{ ...defaultProviderForm, supports_vision: true }}
+        providerForm={{
+          ...defaultProviderForm,
+          models: [{ ...defaultProviderForm.models[0], supports_vision: true }],
+        }}
         providerError=""
         providerSuccess=""
         searchProviderForms={buildSearchProviderForms({
@@ -187,8 +205,8 @@ describe('presentational page components', () => {
 
     expect(html.match(/支持视觉/g)).toHaveLength(1)
     expect(html).toContain('模型能力')
-    expect(html).toContain('供应商状态')
-    expect(html).toContain('启用供应商')
+    expect(html).toContain('模型配置')
+    expect(html).toContain('启用模型')
     expect(html).toContain('OpenAI Responses')
     expect(html).not.toContain('保存 Exa 配置')
     expect(html).not.toContain('保存 Tavily 配置')
@@ -198,7 +216,7 @@ describe('presentational page components', () => {
     const html = renderToStaticMarkup(
       <AdminPage
         adminSection="search-mcp"
-        adminProviders={[makeProvider()]}
+        adminProviders={[makeProviderGroup()]}
         adminSearchProviders={{
           exa: { kind: 'exa', name: 'Exa', is_enabled: true, is_configured: true, api_key_masked: '未设置（可选）' },
           tavily: { kind: 'tavily', name: 'Tavily', is_enabled: false, is_configured: false, api_key_masked: '未设置' },

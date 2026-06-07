@@ -44,9 +44,8 @@ class AdminUserPasswordResetPayload(BaseModel):
     new_password: str = Field(min_length=6, max_length=128)
 
 
-class ProviderBasePayload(BaseModel):
-    name: str = Field(min_length=1, max_length=64)
-    api_format: str = Field(default="anthropic_messages", pattern="^(anthropic_messages|openai_chat|deepseek_chat|siliconflow_chat|openai_responses|gemini)$")
+class ProviderModelPayload(BaseModel):
+    id: int | None = None
     model_name: str = Field(min_length=1, max_length=128)
     supports_thinking: bool = True
     supports_vision: bool = False
@@ -55,6 +54,12 @@ class ProviderBasePayload(BaseModel):
     max_context_window: int = 256000
     max_output_tokens: int = 32000
     is_enabled: bool = True
+
+
+class ProviderBasePayload(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+    api_format: str = Field(default="anthropic_messages", pattern="^(anthropic_messages|openai_chat|deepseek_chat|siliconflow_chat|openai_responses|gemini)$")
+    models: list[ProviderModelPayload] = Field(min_length=1, max_length=50)
 
 
 class ProviderPayload(ProviderBasePayload):

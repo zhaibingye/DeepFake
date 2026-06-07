@@ -1,5 +1,6 @@
 import type {
   AdminManagedUser,
+  AdminProviderGroup,
   AdminSettings,
   ChatRequest,
   ChatStreamEvent,
@@ -172,7 +173,7 @@ export const api = {
     kind: SearchProviderKind,
     body: { api_key: string; is_enabled: boolean },
   ) => request<SearchProviderAvailability[SearchProviderKind]>(`/admin/search-providers/${kind}`, { method: 'PUT', token, body }),
-  listAdminProviders: (token: string) => request<Provider[]>('/admin/providers', { token }),
+  listAdminProviders: (token: string) => request<AdminProviderGroup[]>('/admin/providers', { token }),
   createProvider: (
     token: string,
     body: {
@@ -180,16 +181,19 @@ export const api = {
       api_format: string
       api_url: string
       api_key: string
-      model_name: string
-      supports_thinking: boolean
-      supports_vision: boolean
-      supports_tool_calling: boolean
-      thinking_effort: string
-      max_context_window: number
-      max_output_tokens: number
-      is_enabled: boolean
+      models: Array<{
+        id?: number
+        model_name: string
+        supports_thinking: boolean
+        supports_vision: boolean
+        supports_tool_calling: boolean
+        thinking_effort: string
+        max_context_window: number
+        max_output_tokens: number
+        is_enabled: boolean
+      }>
     },
-  ) => request<Provider>('/admin/providers', { method: 'POST', token, body }),
+  ) => request<AdminProviderGroup>('/admin/providers', { method: 'POST', token, body }),
   updateProvider: (
     token: string,
     providerId: number,
@@ -198,16 +202,19 @@ export const api = {
       api_format: string
       api_url: string
       api_key: string
-      model_name: string
-      supports_thinking: boolean
-      supports_vision: boolean
-      supports_tool_calling: boolean
-      thinking_effort: string
-      max_context_window: number
-      max_output_tokens: number
-      is_enabled: boolean
+      models: Array<{
+        id?: number
+        model_name: string
+        supports_thinking: boolean
+        supports_vision: boolean
+        supports_tool_calling: boolean
+        thinking_effort: string
+        max_context_window: number
+        max_output_tokens: number
+        is_enabled: boolean
+      }>
     },
-  ) => request<Provider>(`/admin/providers/${providerId}`, { method: 'PUT', token, body }),
+  ) => request<AdminProviderGroup>(`/admin/providers/${providerId}`, { method: 'PUT', token, body }),
   deleteProvider: (token: string, providerId: number) =>
     request<{ status: string }>(`/admin/providers/${providerId}`, { method: 'DELETE', token }),
   updateAdminProfile: (

@@ -1,14 +1,14 @@
-import { Bot, LayoutDashboard, LogOut, Search, Settings, Shield, Sparkles, UserRound } from 'lucide-react'
+import { Bot, LayoutDashboard, LogOut, Pencil, Plus, Search, Settings, Shield, Sparkles, Trash2, UserRound } from 'lucide-react'
 
 import type { ProviderApiFormat, ThinkingEffort } from '../../types'
 import type {
   AdminManagedUser,
+  AdminProviderGroup,
   AdminSettings,
-  Provider,
   SearchProviderAvailability,
   SearchProviderKind,
 } from '../../types'
-import type { ProviderFormState } from './providerForm'
+import { createDefaultProviderModel, type ProviderFormState } from './providerForm'
 import type { SearchProviderFormState } from './controller'
 import { normalizeThinkingEffort } from '../../appState'
 import { formatDateTime } from '../../utils'
@@ -16,7 +16,7 @@ import { formatDateTime } from '../../utils'
 export type AdminSection = 'overview' | 'providers' | 'search-mcp' | 'users'
 
 type ProviderCapabilityField = keyof Pick<
-  ProviderFormState,
+  ProviderFormState['models'][number],
   'supports_thinking' | 'supports_vision' | 'supports_tool_calling'
 >
 
@@ -54,7 +54,7 @@ type AdminUserFormState = {
 
 type AdminPageProps = {
   adminSection: AdminSection
-  adminProviders: Provider[]
+  adminProviders: AdminProviderGroup[]
   adminSearchProviders: SearchProviderAvailability | null
   adminUsers: AdminManagedUser[]
   adminSettings: AdminSettings
@@ -90,8 +90,8 @@ type AdminPageProps = {
     React.SetStateAction<Record<SearchProviderKind, SearchProviderFormState>>
   >
   cancelEditingProvider: () => void
-  editProvider: (provider: Provider) => void
-  removeProvider: (provider: Provider) => void
+  editProvider: (provider: AdminProviderGroup) => void
+  removeProvider: (provider: AdminProviderGroup) => void
   toggleAllowRegistration: (value: boolean) => void
   setUserForm: React.Dispatch<React.SetStateAction<AdminUserFormState>>
   setUserSearch: (value: string) => void
@@ -143,13 +143,44 @@ export function AdminPage({
   removeAdminUser,
 }: AdminPageProps) {
   const enabledUsersCount = adminUsers.filter((managedUser) => managedUser.is_enabled).length
-  const enabledProvidersCount = adminProviders.filter((provider) => provider.is_enabled).length
+  const enabledProvidersCount = adminProviders.filter((provider) => provider.models.some((model) => model.is_enabled)).length
+  const providerModelCount = adminProviders.reduce((total, provider) => total + provider.models.length, 0)
+  const enabledProviderModelCount = adminProviders.reduce(
+    (total, provider) => total + provider.models.filter((model) => model.is_enabled).length,
+    0,
+  )
 
-  const updateProviderCapability = (field: ProviderCapabilityField, checked: boolean) => {
+  const updateProviderModel = (
+    modelIndex: number,
+    patch: Partial<ProviderFormState['models'][number]>,
+  ) => {
+    setProviderForm((prev) => ({
+      ...prev,
+      models: prev.models.map((model, index) => (index === modelIndex ? { ...model, ...patch } : model)),
+    }))
+  }
+
+  const updateProviderCapability = (modelIndex: number, field: ProviderCapabilityField, checked: boolean) => {
+    updateProviderModel(modelIndex, { [field]: checked })
+  }
+
+  const addProviderModel = () => {
     setProviderForm((prev) => {
-      const next = { ...prev }
-      next[field] = checked
-      return next
+      const thinking_effort = normalizeThinkingEffort('high', prev.api_format)
+      return {
+        ...prev,
+        models: [...prev.models, { ...createDefaultProviderModel(), thinking_effort }],
+      }
+    })
+  }
+
+  const removeProviderModel = (modelIndex: number) => {
+    setProviderForm((prev) => {
+      if (prev.models.length <= 1) return prev
+      return {
+        ...prev,
+        models: prev.models.filter((_, index) => index !== modelIndex),
+      }
     })
   }
 
@@ -218,7 +249,12 @@ export function AdminPage({
                 <div className="admin-metric-card">
                   <strong>{adminProviders.length}</strong>
                   <span>供应商总数</span>
-                  <small>{enabledProvidersCount} 个启用中</small>
+                  <small>{enabledProvidersCount} 个含启用模型</small>
+                </div>
+                <div className="admin-metric-card">
+                  <strong>{providerModelCount}</strong>
+                  <span>模型总数</span>
+                  <small>{enabledProviderModelCount} 个启用中</small>
                 </div>
                 <div className="admin-metric-card">
                   <strong>{adminUsers.length}</strong>
@@ -261,7 +297,7 @@ export function AdminPage({
               <section className="panel-card">
                 <div className="panel-title"><UserRound size={16} /> 注册设置</div>
                 <div className="settings-stack">
-                  <label className="checkbox-row checkbox-card">
+                  <label className="provider-option-card">
                     <input checked={adminSettings.allow_registration} id="admin-overview-allow-registration" name="allow_registration" onChange={(event) => void toggleAllowRegistration(event.target.checked)} type="checkbox" />
                     <span>{adminSettings.allow_registration ? '允许普通用户注册' : '关闭普通用户注册'}</span>
                   </label>
@@ -277,130 +313,187 @@ export function AdminPage({
             <section className="panel-card admin-section-intro">
               <div>
                 <div className="panel-title"><Shield size={16} /> 供应商管理</div>
-                <p>单独维护模型接入、能力开关和输出限制。编辑已有供应商时，留空连接 URL 或 Key 会保留当前值。</p>
+                <p>供应商只维护共享连接信息；同一供应商下可以配置多个模型，每个模型单独维护能力开关和输出限制。</p>
               </div>
-              <div className="meta-chip soft compact">共 {adminProviders.length} 个供应商</div>
+              <div className="meta-chip soft compact">共 {adminProviders.length} 个供应商 / {providerModelCount} 个模型</div>
             </section>
 
             <section className="admin-detail-grid">
               <section className="panel-card">
                 <div className="panel-title"><Shield size={16} /> {editingProviderId ? '编辑供应商' : '添加供应商'}</div>
                 <form className="admin-form" onSubmit={onSubmitProvider}>
-                  <label>
-                    供应商名称
-                    <input autoComplete="off" id="provider-name" name="provider_name" value={providerForm.name} onChange={(event) => setProviderForm((prev) => ({ ...prev, name: event.target.value }))} />
-                  </label>
-                  <label>
-                    接口格式
-                    <select
-                      id="provider-api-format"
-                      name="api_format"
-                      value={providerForm.api_format}
-                      onChange={(event) => {
-                        const apiFormat = event.target.value as ProviderApiFormat
-                        setProviderForm((prev) => ({
-                          ...prev,
-                          api_format: apiFormat,
-                          thinking_effort: normalizeThinkingEffort(prev.thinking_effort, apiFormat),
-                        }))
-                      }}
-                    >
-                      <option value="anthropic_messages">Anthropic Messages</option>
-                      <option value="openai_chat">OpenAI Chat Completions</option>
-                      <option value="deepseek_chat">DeepSeek Chat Completions</option>
-                      <option value="siliconflow_chat">SiliconFlow Chat Completions</option>
-                      <option value="openai_responses">OpenAI Responses</option>
-                      <option value="gemini">Gemini</option>
-                    </select>
-                  </label>
-                  {editingProviderId ? (
-                    <div className="connection-hint-card">
-                      <div>
-                        <strong>留空连接信息会保留现有值</strong>
-                        <span>仅在需要切换地址或密钥时重新填写，空白不会覆盖当前配置。</span>
+                  <section className="provider-config-section provider-connection-section">
+                    <div className="provider-option-heading">
+                      <span>共享连接配置</span>
+                      <small>同一供应商下所有模型共用接口格式、URL 和 Key。</small>
+                    </div>
+                    <label>
+                      供应商名称
+                      <input autoComplete="off" id="provider-name" name="provider_name" value={providerForm.name} onChange={(event) => setProviderForm((prev) => ({ ...prev, name: event.target.value }))} />
+                    </label>
+                    <label>
+                      接口格式
+                      <select
+                        id="provider-api-format"
+                        name="api_format"
+                        value={providerForm.api_format}
+                        onChange={(event) => {
+                          const apiFormat = event.target.value as ProviderApiFormat
+                          setProviderForm((prev) => ({
+                            ...prev,
+                            api_format: apiFormat,
+                            models: prev.models.map((model) => ({
+                              ...model,
+                              thinking_effort: normalizeThinkingEffort(model.thinking_effort, apiFormat),
+                            })),
+                          }))
+                        }}
+                      >
+                        <option value="anthropic_messages">Anthropic Messages</option>
+                        <option value="openai_chat">OpenAI Chat Completions</option>
+                        <option value="deepseek_chat">DeepSeek Chat Completions</option>
+                        <option value="siliconflow_chat">SiliconFlow Chat Completions</option>
+                        <option value="openai_responses">OpenAI Responses</option>
+                        <option value="gemini">Gemini</option>
+                      </select>
+                    </label>
+                    {editingProviderId ? (
+                      <div className="connection-hint-card">
+                        <div>
+                          <strong>留空连接信息会保留现有值</strong>
+                          <span>仅在需要切换地址或密钥时重新填写，空白不会覆盖当前配置。</span>
+                        </div>
                       </div>
-                    </div>
-                  ) : null}
-                  <label>
-                    API URL
-                    <input
-                      autoComplete="url"
-                      id="provider-api-url"
-                      name="api_url"
-                      value={providerForm.api_url}
-                      onChange={(event) => setProviderForm((prev) => ({ ...prev, api_url: event.target.value }))}
-                      placeholder={providerApiUrlPlaceholder}
-                    />
-                  </label>
-                  <label>
-                    API Key
-                    <input
-                      autoComplete="off"
-                      id="provider-api-key"
-                      name="api_key"
-                      type="password"
-                      value={providerForm.api_key}
-                      onChange={(event) => setProviderForm((prev) => ({ ...prev, api_key: event.target.value }))}
-                      placeholder="输入供应商密钥"
-                    />
-                  </label>
-                  <label>
-                    模型名称
-                    <input autoComplete="off" id="provider-model-name" name="model_name" value={providerForm.model_name} onChange={(event) => setProviderForm((prev) => ({ ...prev, model_name: event.target.value }))} />
-                  </label>
-                  <div className="inline-grid">
+                    ) : null}
                     <label>
-                      最大上下文
-                      <input id="provider-max-context-window" name="max_context_window" type="number" value={providerForm.max_context_window} onChange={(event) => setProviderForm((prev) => ({ ...prev, max_context_window: Number(event.target.value) }))} />
+                      API URL
+                      <input
+                        autoComplete="url"
+                        id="provider-api-url"
+                        name="api_url"
+                        value={providerForm.api_url}
+                        onChange={(event) => setProviderForm((prev) => ({ ...prev, api_url: event.target.value }))}
+                        placeholder={providerApiUrlPlaceholder}
+                      />
                     </label>
                     <label>
-                      最大输出
-                      <input id="provider-max-output-tokens" name="max_output_tokens" type="number" value={providerForm.max_output_tokens} onChange={(event) => setProviderForm((prev) => ({ ...prev, max_output_tokens: Number(event.target.value) }))} />
+                      API Key
+                      <input
+                        autoComplete="off"
+                        id="provider-api-key"
+                        name="api_key"
+                        type="password"
+                        value={providerForm.api_key}
+                        onChange={(event) => setProviderForm((prev) => ({ ...prev, api_key: event.target.value }))}
+                        placeholder="输入供应商密钥"
+                      />
                     </label>
-                  </div>
-                  <div className="provider-option-group">
-                    <div className="provider-option-heading">
-                      <span>模型能力</span>
-                      <small>这些开关决定聊天页会开放哪些输入和工具能力。</small>
+                  </section>
+                  <section className="provider-config-section provider-models-editor">
+                    <div className="provider-option-heading provider-models-heading">
+                      <div>
+                        <span>模型配置</span>
+                        <small>URL 和 Key 由供应商共享，下面每个模型的能力、上下文、输出和状态互不影响。</small>
+                      </div>
+                      <button className="provider-add-model-btn" onClick={addProviderModel} type="button">
+                        <Plus size={15} />
+                        添加模型
+                      </button>
                     </div>
-                    <div className="provider-option-grid">
-                      {providerCapabilities.map((capability) => (
-                        <label className="provider-option-card" key={capability.field}>
+                    {providerForm.models.map((model, modelIndex) => (
+                      <section className="provider-model-editor" key={model.id ?? `new-${modelIndex}`}>
+                        <div className="provider-model-editor-head">
+                          <strong>模型 {modelIndex + 1}</strong>
+                          <button
+                            className="mini-icon-btn danger"
+                            disabled={providerForm.models.length <= 1}
+                            onClick={() => removeProviderModel(modelIndex)}
+                            title="移除模型"
+                            type="button"
+                          >
+                            <Trash2 size={15} />
+                          </button>
+                        </div>
+                        <label>
+                          模型名称
                           <input
-                            checked={providerForm[capability.field]}
-                            id={`provider-${capability.field}`}
-                            name={capability.field}
-                            onChange={(event) => updateProviderCapability(capability.field, event.target.checked)}
-                            type="checkbox"
+                            autoComplete="off"
+                            id={`provider-model-name-${modelIndex}`}
+                            name={`model_name_${modelIndex}`}
+                            value={model.model_name}
+                            onChange={(event) => updateProviderModel(modelIndex, { model_name: event.target.value })}
                           />
-                          <span>{capability.checkboxLabel}</span>
                         </label>
-                      ))}
-                    </div>
-                  </div>
-                  <div className="provider-option-group">
-                    <div className="provider-option-heading">
-                      <span>供应商状态</span>
-                      <small>关闭后普通用户不能再选择该供应商，已有会话记录不会被删除。</small>
-                    </div>
-                    <label className="provider-option-card provider-status-option">
-                      <input checked={providerForm.is_enabled} id="provider-is-enabled" name="is_enabled" onChange={(event) => setProviderForm((prev) => ({ ...prev, is_enabled: event.target.checked }))} type="checkbox" />
-                      <span>启用供应商</span>
-                    </label>
-                  </div>
-                  <label>
-                    思考努力等级
-                    <select
-                      id="provider-thinking-effort"
-                      name="thinking_effort"
-                      value={providerForm.thinking_effort}
-                      onChange={(event) => setProviderForm((prev) => ({ ...prev, thinking_effort: event.target.value as ThinkingEffort }))}
-                    >
-                      {thinkingEffortOptions.map((option) => (
-                        <option key={option} value={option}>{option}</option>
-                      ))}
-                    </select>
-                  </label>
+                        <div className="inline-grid">
+                          <label>
+                            最大上下文
+                            <input
+                              id={`provider-max-context-window-${modelIndex}`}
+                              name={`max_context_window_${modelIndex}`}
+                              type="number"
+                              value={model.max_context_window}
+                              onChange={(event) => updateProviderModel(modelIndex, { max_context_window: Number(event.target.value) })}
+                            />
+                          </label>
+                          <label>
+                            最大输出
+                            <input
+                              id={`provider-max-output-tokens-${modelIndex}`}
+                              name={`max_output_tokens_${modelIndex}`}
+                              type="number"
+                              value={model.max_output_tokens}
+                              onChange={(event) => updateProviderModel(modelIndex, { max_output_tokens: Number(event.target.value) })}
+                            />
+                          </label>
+                        </div>
+                        <div className="provider-option-group">
+                          <div className="provider-option-heading">
+                            <span>模型能力</span>
+                            <small>这些开关决定聊天页会开放哪些输入和工具能力。</small>
+                          </div>
+                          <div className="provider-option-grid">
+                            {providerCapabilities.map((capability) => (
+                              <label className="provider-option-card" key={capability.field}>
+                                <input
+                                  checked={model[capability.field]}
+                                  id={`provider-${capability.field}-${modelIndex}`}
+                                  name={`${capability.field}_${modelIndex}`}
+                                  onChange={(event) => updateProviderCapability(modelIndex, capability.field, event.target.checked)}
+                                  type="checkbox"
+                                />
+                                <span>{capability.checkboxLabel}</span>
+                              </label>
+                            ))}
+                          </div>
+                        </div>
+                        <div className="inline-grid">
+                          <label>
+                            思考努力等级
+                            <select
+                              id={`provider-thinking-effort-${modelIndex}`}
+                              name={`thinking_effort_${modelIndex}`}
+                              value={model.thinking_effort}
+                              onChange={(event) => updateProviderModel(modelIndex, { thinking_effort: event.target.value as ThinkingEffort })}
+                            >
+                              {thinkingEffortOptions.map((option) => (
+                                <option key={option} value={option}>{option}</option>
+                              ))}
+                            </select>
+                          </label>
+                          <label className="provider-option-card provider-status-option">
+                            <input
+                              checked={model.is_enabled}
+                              id={`provider-is-enabled-${modelIndex}`}
+                              name={`is_enabled_${modelIndex}`}
+                              onChange={(event) => updateProviderModel(modelIndex, { is_enabled: event.target.checked })}
+                              type="checkbox"
+                            />
+                            <span>{model.is_enabled ? '模型已启用' : '模型已停用'}</span>
+                          </label>
+                        </div>
+                      </section>
+                    ))}
+                  </section>
                   {providerError ? <div className="error-text">{providerError}</div> : null}
                   {providerSuccess ? <div className="success-text">{providerSuccess}</div> : null}
                   <div className="action-row">
@@ -418,26 +511,45 @@ export function AdminPage({
                 <div className="panel-title"><LayoutDashboard size={16} /> 已配置供应商</div>
                 <div className="provider-table">
                   {adminProviders.map((provider) => (
-                    <div className="provider-row" key={provider.id}>
-                      <div>
-                        <strong>{provider.name}</strong>
-                        <span>{provider.model_name}</span>
+                    <section className="provider-group-row" key={provider.id}>
+                      <div className="provider-group-head">
+                        <div>
+                          <strong>{provider.name}</strong>
+                          <span>{providerApiFormatLabels[provider.api_format]} / {provider.models.length} 个模型</span>
+                          <span className="masked-key">{provider.api_key_masked}</span>
+                        </div>
+                        <div className="provider-actions">
+                          <button className="ghost-btn" onClick={() => void editProvider(provider)} type="button">
+                            <Pencil size={15} />
+                            编辑
+                          </button>
+                          <button className="ghost-btn danger-text" onClick={() => void removeProvider(provider)} type="button">
+                            <Trash2 size={15} />
+                            删除
+                          </button>
+                        </div>
                       </div>
-                      <div className="provider-flags">
-                        <span className="meta-chip">{providerApiFormatLabels[provider.api_format]}</span>
-                        {providerCapabilities.map((capability) =>
-                          provider[capability.field] ? <span className="meta-chip" key={capability.field}>{capability.chipLabel}</span> : null,
-                        )}
-                        <span className="meta-chip">输出 {provider.max_output_tokens}</span>
-                        <span className="meta-chip">{provider.is_enabled ? '启用中' : '已禁用'}</span>
+                      <div className="provider-model-list">
+                        {provider.models.map((model) => (
+                          <div className="provider-row provider-model-row" key={model.id}>
+                            <div>
+                              <strong>{model.model_name}</strong>
+                              <span>{model.is_enabled ? '启用中' : '已禁用'}</span>
+                            </div>
+                            <div className="provider-flags">
+                              {providerCapabilities.map((capability) =>
+                                model[capability.field] ? <span className="meta-chip" key={capability.field}>{capability.chipLabel}</span> : null,
+                              )}
+                              <span className="meta-chip">上下文 {model.max_context_window}</span>
+                              <span className="meta-chip">输出 {model.max_output_tokens}</span>
+                              <span className="meta-chip">思考 {model.thinking_effort}</span>
+                            </div>
+                          </div>
+                        ))}
                       </div>
-                      <div className="provider-actions">
-                        <span className="masked-key">{provider.api_key_masked}</span>
-                        <button className="ghost-btn" onClick={() => void editProvider(provider)} type="button">编辑</button>
-                        <button className="ghost-btn danger-text" onClick={() => void removeProvider(provider)} type="button">删除</button>
-                      </div>
-                    </div>
+                    </section>
                   ))}
+                  {adminProviders.length === 0 ? <div className="empty-tip">暂无供应商。</div> : null}
                 </div>
               </section>
             </section>
@@ -473,19 +585,22 @@ export function AdminPage({
                   </div>
                 </div>
                 <form className="admin-form" onSubmit={(event) => onSubmitSearchProvider('exa', event)}>
-                  <label className="search-toggle-card">
+                  <div className="search-toggle-card">
                     <div className="search-toggle-copy">
                       <strong>允许用户在聊天中选择 Exa 搜索</strong>
                       <span>关闭后，聊天页不会再显示 Exa 作为可选搜索来源。</span>
                     </div>
-                    <input
-                      checked={searchProviderForms.exa.is_enabled}
-                      id="search-mcp-exa-enabled"
-                      name="exa_enabled"
-                      onChange={(event) => updateSearchProviderForm('exa', { is_enabled: event.target.checked })}
-                      type="checkbox"
-                    />
-                  </label>
+                    <label className="provider-option-card">
+                      <input
+                        checked={searchProviderForms.exa.is_enabled}
+                        id="search-mcp-exa-enabled"
+                        name="exa_enabled"
+                        onChange={(event) => updateSearchProviderForm('exa', { is_enabled: event.target.checked })}
+                        type="checkbox"
+                      />
+                      <span>{searchProviderForms.exa.is_enabled ? '已启用' : '已停用'}</span>
+                    </label>
+                  </div>
                   <label>
                     Exa API Key（可选）
                     <input
@@ -517,19 +632,22 @@ export function AdminPage({
                   </div>
                 </div>
                 <form className="admin-form" onSubmit={(event) => onSubmitSearchProvider('tavily', event)}>
-                  <label className="search-toggle-card">
+                  <div className="search-toggle-card">
                     <div className="search-toggle-copy">
                       <strong>允许用户在聊天中选择 Tavily 搜索</strong>
                       <span>关闭后，聊天页不会再显示 Tavily 作为可选搜索来源。</span>
                     </div>
-                    <input
-                      checked={searchProviderForms.tavily.is_enabled}
-                      id="search-mcp-tavily-enabled"
-                      name="tavily_enabled"
-                      onChange={(event) => updateSearchProviderForm('tavily', { is_enabled: event.target.checked })}
-                      type="checkbox"
-                    />
-                  </label>
+                    <label className="provider-option-card">
+                      <input
+                        checked={searchProviderForms.tavily.is_enabled}
+                        id="search-mcp-tavily-enabled"
+                        name="tavily_enabled"
+                        onChange={(event) => updateSearchProviderForm('tavily', { is_enabled: event.target.checked })}
+                        type="checkbox"
+                      />
+                      <span>{searchProviderForms.tavily.is_enabled ? '已启用' : '已停用'}</span>
+                    </label>
+                  </div>
                   <label>
                     Tavily API Key（必填）
                     <input
@@ -563,7 +681,7 @@ export function AdminPage({
               <section className="panel-card">
                 <div className="panel-title"><UserRound size={16} /> 注册与创建</div>
                 <div className="settings-stack">
-                  <label className="checkbox-row checkbox-card">
+                  <label className="provider-option-card">
                     <input checked={adminSettings.allow_registration} id="admin-users-allow-registration" name="allow_registration" onChange={(event) => void toggleAllowRegistration(event.target.checked)} type="checkbox" />
                     <span>{adminSettings.allow_registration ? '允许普通用户注册' : '关闭普通用户注册'}</span>
                   </label>
@@ -586,9 +704,9 @@ export function AdminPage({
                           <option value="admin">管理员</option>
                         </select>
                       </label>
-                      <label className="checkbox-row checkbox-row-inline">
+                      <label className="provider-option-card">
                         <input checked={userForm.is_enabled} id="admin-user-is-enabled" name="is_enabled" onChange={(event) => setUserForm((prev) => ({ ...prev, is_enabled: event.target.checked }))} type="checkbox" />
-                        创建后立即启用
+                        <span>{userForm.is_enabled ? '创建后立即启用' : '创建后暂不启用'}</span>
                       </label>
                     </div>
                     {userAdminMessage ? <div className={userAdminError ? 'error-text' : 'success-text'}>{userAdminMessage}</div> : null}

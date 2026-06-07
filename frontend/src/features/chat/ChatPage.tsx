@@ -1,4 +1,5 @@
-import { Eye, FileImage, LayoutDashboard, LogOut, MessageSquarePlus, PanelLeftClose, PanelLeftOpen, Pencil, SendHorizonal, Sparkles, Square, Trash2, UserRound, BrainCircuit } from 'lucide-react'
+import { ArrowUp, Bot, BrainCircuit, Check, ChevronDown, FileImage, LayoutDashboard, LogOut, MessageSquarePlus, PanelLeftClose, PanelLeftOpen, Pencil, Sparkles, Square, Trash2, UserRound, X } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { MarkdownView } from '../../components/MarkdownView'
 import { TimelineList } from '../../components/chat/TimelineList'
@@ -32,6 +33,15 @@ type PendingUserMessage = {
   text: string
   attachments: Attachment[]
   createdAt: string
+}
+
+type ToolDrawer = 'thinking' | 'search' | 'provider'
+
+type ProviderGroup = {
+  id: string
+  name: string
+  apiFormat: Provider['api_format']
+  models: Provider[]
 }
 
 type ChatPageProps = {
@@ -97,6 +107,64 @@ function renderImageGrid(images: Array<Pick<Attachment, 'media_type' | 'data'>>,
   )
 }
 
+function thinkingEffortLabel(value: ThinkingEffort) {
+  const labels: Record<ThinkingEffort, string> = {
+    low: '低',
+    medium: '中',
+    high: '高',
+    max: '最高',
+    xhigh: '超高',
+  }
+  return labels[value]
+}
+
+function providerApiFormatLabel(value: Provider['api_format']) {
+  const labels: Record<Provider['api_format'], string> = {
+    anthropic_messages: 'Anthropic Messages',
+    openai_chat: 'OpenAI Chat',
+    deepseek_chat: 'DeepSeek Chat',
+    siliconflow_chat: 'SiliconFlow Chat',
+    openai_responses: 'OpenAI Responses',
+    gemini: 'Gemini',
+  }
+  return labels[value]
+}
+
+function modelCapabilityText(provider: Provider) {
+  const capabilities = [
+    provider.supports_thinking ? '思考' : null,
+    provider.supports_vision ? '视觉' : null,
+    provider.supports_tool_calling ? '工具调用' : null,
+  ].filter(Boolean)
+
+  return capabilities.length ? capabilities.join(' · ') : '基础对话'
+}
+
+function groupProviders(providers: Provider[]) {
+  const groups: ProviderGroup[] = []
+  const groupById = new Map<string, ProviderGroup>()
+
+  providers.forEach((provider) => {
+    const id = String(provider.connection_id ?? provider.id)
+    const existingGroup = groupById.get(id)
+    if (existingGroup) {
+      existingGroup.models.push(provider)
+      return
+    }
+
+    const group = {
+      id,
+      name: provider.name,
+      apiFormat: provider.api_format,
+      models: [provider],
+    }
+    groupById.set(id, group)
+    groups.push(group)
+  })
+
+  return groups
+}
+
 export function ChatPage({
   sidebarCollapsed,
   chatLoading,
@@ -145,50 +213,175 @@ export function ChatPage({
   handleFileChange,
   setEffort,
 }: ChatPageProps) {
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
+  const [openToolDrawer, setOpenToolDrawer] = useState<ToolDrawer | null>(null)
+  const toolDrawerRef = useRef<HTMLDivElement | null>(null)
+  const visibleToolDrawer = (
+    openToolDrawer === 'thinking' && !selectedProvider?.supports_thinking
+      ? null
+      : openToolDrawer === 'search' && !selectedProviderSupportsToolCalling
+        ? null
+        : openToolDrawer
+  )
+
+  const closeMobileSidebar = useCallback(() => setMobileSidebarOpen(false), [])
+
+  const toggleToolDrawer = useCallback((drawer: ToolDrawer) => {
+    setOpenToolDrawer((current) => (current === drawer ? null : drawer))
+  }, [])
+
+  const wrappedStartNewConversation = useCallback(() => {
+    closeMobileSidebar()
+    setOpenToolDrawer(null)
+    startNewConversation()
+  }, [closeMobileSidebar, startNewConversation])
+
+  const wrappedOpenConversation = useCallback((conversationId: number) => {
+    closeMobileSidebar()
+    setOpenToolDrawer(null)
+    void openConversation(conversationId)
+  }, [closeMobileSidebar, openConversation])
+
+  const wrappedNavigateToAdmin = useCallback(() => {
+    closeMobileSidebar()
+    setOpenToolDrawer(null)
+    navigateToAdmin()
+  }, [closeMobileSidebar, navigateToAdmin])
+
+  const wrappedHandleLogout = useCallback(() => {
+    closeMobileSidebar()
+    setOpenToolDrawer(null)
+    handleLogout()
+  }, [closeMobileSidebar, handleLogout])
+
+  useEffect(() => {
+    const handleResize = () => {
+      if (window.innerWidth > 860) {
+        setMobileSidebarOpen(false)
+      }
+    }
+    window.addEventListener('resize', handleResize)
+    return () => window.removeEventListener('resize', handleResize)
+  }, [])
+
+  useEffect(() => {
+    if (!mobileSidebarOpen) return
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setMobileSidebarOpen(false)
+      }
+    }
+    window.addEventListener('keydown', handleKey)
+    return () => window.removeEventListener('keydown', handleKey)
+  }, [mobileSidebarOpen])
+
+  useEffect(() => {
+    if (!visibleToolDrawer) return
+    const handlePointerDown = (event: PointerEvent) => {
+      if (toolDrawerRef.current?.contains(event.target as Node)) {
+        return
+      }
+      setOpenToolDrawer(null)
+    }
+    const handleKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setOpenToolDrawer(null)
+      }
+    }
+    document.addEventListener('pointerdown', handlePointerDown)
+    window.addEventListener('keydown', handleKey)
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown)
+      window.removeEventListener('keydown', handleKey)
+    }
+  }, [visibleToolDrawer])
+
+  const toolButtonClass = (drawer: ToolDrawer, active = false) => (
+    ['tool-btn', active ? 'active' : '', visibleToolDrawer === drawer ? 'open' : ''].filter(Boolean).join(' ')
+  )
+
+  const selectedProviderLabel = selectedProvider?.model_name ?? '未选择'
+  const selectedProviderTitle = selectedProvider ? `${selectedProvider.name} / ${selectedProvider.model_name}` : '未选择'
+  const selectedSearchProviderLabel = searchProviderLabel(searchProvider)
+  const providerGroups = useMemo(() => groupProviders(providers), [providers])
+  const canSendMessage = Boolean(selectedProviderId && (input.trim().length > 0 || attachments.length > 0))
+
   return (
     <div className={sidebarCollapsed ? 'chat-shell sidebar-collapsed' : 'chat-shell'}>
-      <aside className={sidebarCollapsed ? 'chat-sidebar collapsed' : 'chat-sidebar'}>
+      <div className="mobile-topbar">
+        <button
+          aria-label="展开侧边栏"
+          className="icon-btn sidebar-toggle"
+          onClick={() => setMobileSidebarOpen(true)}
+          title="展开侧边栏"
+          type="button"
+        >
+          <PanelLeftOpen size={18} />
+        </button>
+        <div className="mobile-topbar-title">
+          {currentConversation?.title ?? 'deepfake'}
+        </div>
+        <button
+          aria-label="开启新对话"
+          className="icon-btn"
+          onClick={wrappedStartNewConversation}
+          title="开启新对话"
+          type="button"
+        >
+          <MessageSquarePlus size={18} />
+        </button>
+      </div>
+
+      {mobileSidebarOpen ? (
+        <div
+          className="mobile-sidebar-overlay"
+          onClick={closeMobileSidebar}
+          role="presentation"
+        />
+      ) : null}
+
+      <aside className={(sidebarCollapsed && !mobileSidebarOpen ? 'chat-sidebar collapsed' : 'chat-sidebar') + (mobileSidebarOpen ? ' mobile-open' : '')}>
         <div className="sidebar-top">
           <div className="sidebar-brand">
             <div className="brand-lockup">
-              {sidebarCollapsed ? (
+              {sidebarCollapsed && !mobileSidebarOpen ? (
                 <div className="brand-mark solid"><DeepfakeWhaleIcon className="whale-icon" /></div>
               ) : (
                 <img alt="deepfake" className="brand-logo-image" src="/deepfake-logo.png" />
               )}
             </div>
-            <button aria-label={sidebarCollapsed ? '展开侧边栏' : '收起侧边栏'} className="icon-btn sidebar-toggle" onClick={toggleSidebar} title={sidebarCollapsed ? '展开侧边栏' : '收起侧边栏'} type="button">
-              {sidebarCollapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
+            <button aria-label={mobileSidebarOpen ? '关闭侧边栏' : (sidebarCollapsed ? '展开侧边栏' : '收起侧边栏')} className="icon-btn sidebar-toggle" onClick={mobileSidebarOpen ? closeMobileSidebar : toggleSidebar} title={mobileSidebarOpen ? '关闭侧边栏' : (sidebarCollapsed ? '展开侧边栏' : '收起侧边栏')} type="button">
+              {mobileSidebarOpen ? <X size={16} /> : (sidebarCollapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />)}
             </button>
           </div>
 
           <button
-            className={sidebarCollapsed ? 'new-chat-btn icon-only' : 'new-chat-btn'}
+            className={sidebarCollapsed && !mobileSidebarOpen ? 'new-chat-btn icon-only' : 'new-chat-btn'}
             disabled={chatLoading}
-            onClick={startNewConversation}
+            onClick={wrappedStartNewConversation}
             title="开启新对话"
             type="button"
           >
             <MessageSquarePlus size={16} />
-            {sidebarCollapsed ? null : '开启新对话'}
+            {sidebarCollapsed && !mobileSidebarOpen ? null : '开启新对话'}
           </button>
         </div>
 
-        <div className={sidebarCollapsed ? 'conversation-list collapsed' : 'conversation-list'}>
-          {sidebarCollapsed ? null : <div className="section-title">7 天内</div>}
-          {!sidebarCollapsed && conversations.length === 0 ? <div className="empty-tip">还没有会话，发一条消息开始。</div> : null}
+        <div className={sidebarCollapsed && !mobileSidebarOpen ? 'conversation-list collapsed' : 'conversation-list'}>
+          {sidebarCollapsed && !mobileSidebarOpen ? null : <div className="section-title">7 天内</div>}
+          {!(sidebarCollapsed && !mobileSidebarOpen) && conversations.length === 0 ? <div className="empty-tip">还没有会话，发一条消息开始。</div> : null}
           {conversations.map((conversation) => (
             <div key={conversation.id} className={activeConversationId === conversation.id ? 'conversation-item active' : 'conversation-item'}>
               <button
                 className="conversation-main"
                 disabled={chatLoading}
-                onClick={() => void openConversation(conversation.id)}
+                onClick={() => wrappedOpenConversation(conversation.id)}
                 type="button"
               >
-                <span>{sidebarCollapsed ? conversation.title.slice(0, 1) : conversation.title}</span>
-                {sidebarCollapsed ? null : <small>{conversation.provider_name} / {conversation.model_name}</small>}
+                <span>{sidebarCollapsed && !mobileSidebarOpen ? conversation.title.slice(0, 1) : conversation.title}</span>
+                {sidebarCollapsed && !mobileSidebarOpen ? null : <small>{conversation.provider_name} / {conversation.model_name}</small>}
               </button>
-              <div className={sidebarCollapsed ? 'conversation-actions hidden' : 'conversation-actions'}>
+              <div className={sidebarCollapsed && !mobileSidebarOpen ? 'conversation-actions hidden' : 'conversation-actions'}>
                 <button
                   aria-label="重命名会话"
                   className="mini-icon-btn"
@@ -215,21 +408,21 @@ export function ChatPage({
         </div>
 
         <div className="sidebar-footer">
-          <div className={sidebarCollapsed ? 'user-card compact collapsed' : 'user-card compact'}>
+          <div className={sidebarCollapsed && !mobileSidebarOpen ? 'user-card compact collapsed' : 'user-card compact'}>
             <div className="user-meta">
               <div className="avatar"><UserRound size={15} /></div>
-              <div className={sidebarCollapsed ? 'hidden' : ''}>
+              <div className={sidebarCollapsed && !mobileSidebarOpen ? 'hidden' : ''}>
                 <strong>{user.username}</strong>
                 <span>{user.role === 'admin' ? '管理员' : '普通用户'}</span>
               </div>
             </div>
             <div className="user-actions">
               {user.role === 'admin' ? (
-                <button className="icon-btn" onClick={navigateToAdmin} title="管理后台" type="button">
+                <button className="icon-btn" onClick={wrappedNavigateToAdmin} title="管理后台" type="button">
                   <LayoutDashboard size={16} />
                 </button>
               ) : null}
-              <button className="icon-btn" onClick={handleLogout} title="退出登录" type="button">
+              <button className="icon-btn" onClick={wrappedHandleLogout} title="退出登录" type="button">
                 <LogOut size={16} />
               </button>
             </div>
@@ -333,73 +526,202 @@ export function ChatPage({
               </div>
             ) : null}
 
-            <div className="composer-toolbar">
+            <div className="composer-toolbar" ref={toolDrawerRef}>
               <div className="left-tools">
                 {selectedProvider?.supports_thinking ? (
                   <button
-                    className={enableThinking ? 'tool-btn active' : 'tool-btn'}
-                    onClick={() => setEnableThinking((value) => !value)}
+                    aria-controls="chat-tool-drawer"
+                    aria-expanded={visibleToolDrawer === 'thinking'}
+                    className={toolButtonClass('thinking', enableThinking)}
+                    onClick={() => toggleToolDrawer('thinking')}
+                    title="深度思考设置"
                     type="button"
                   >
                     <BrainCircuit size={15} />
-                    深度思考
+                    <span className="tool-btn-label">深度思考</span>
+                    <span className="tool-btn-detail">{enableThinking ? thinkingEffortLabel(effort) : '关闭'}</span>
+                    <ChevronDown size={14} />
                   </button>
                 ) : null}
-                {selectedProvider?.supports_thinking && enableThinking ? (
-                  <select id="chat-thinking-effort" name="thinking_effort" value={effort} onChange={(event) => setEffort(event.target.value as ThinkingEffort)}>
-                    {thinkingEffortOptions.map((option) => (
-                      <option key={option} value={option}>{option}</option>
-                    ))}
-                  </select>
-                ) : null}
                 <button
-                  className={enableSearch ? 'tool-btn active' : 'tool-btn'}
-                  onClick={() => {
-                    setChatError('')
-                    setEnableSearch((value) => !value)
-                  }}
+                  aria-controls="chat-tool-drawer"
+                  aria-expanded={visibleToolDrawer === 'search'}
+                  className={toolButtonClass('search', enableSearch)}
+                  onClick={() => toggleToolDrawer('search')}
                   disabled={!selectedProviderSupportsToolCalling}
                   title={
                     selectedProviderSupportsToolCalling
-                      ? '允许模型按需使用联网搜索'
+                      ? '联网搜索设置'
                       : '当前模型不支持原生工具调用'
                   }
                   type="button"
                 >
                   <Sparkles size={15} />
-                  联网搜索
+                  <span className="tool-btn-label">联网搜索</span>
+                  <span className="tool-btn-detail">{enableSearch ? selectedSearchProviderLabel : '关闭'}</span>
+                  <ChevronDown size={14} />
                 </button>
-                <select
-                  disabled={!enableSearch}
-                  id="chat-search-provider"
-                  name="search_provider"
-                  value={searchProvider}
-                  onChange={(event) => {
-                    setChatError('')
-                    setSearchProvider(event.target.value as SearchProviderKind)
-                  }}
+                <button
+                  aria-controls="chat-tool-drawer"
+                  aria-expanded={visibleToolDrawer === 'provider'}
+                  className={toolButtonClass('provider', Boolean(selectedProviderId))}
+                  disabled={!providers.length}
+                  onClick={() => toggleToolDrawer('provider')}
+                  title={`选择模型：${selectedProviderTitle}`}
+                  aria-label={`选择模型，当前 ${selectedProviderTitle}`}
+                  type="button"
                 >
-                  {searchProviderOptions.map((option) => {
-                    const status = searchProviders?.[option]
-                    const label = searchProviderLabel(option)
-                    return (
-                      <option key={option} value={option}>
-                        {status && !isSearchProviderAvailable(status) ? `${label}（不可用）` : label}
-                      </option>
-                    )
-                  })}
-                </select>
-                <select className="provider-select inline" id="chat-provider" name="provider_id" value={selectedProviderId ?? ''} onChange={(event) => applyProviderSelection(Number(event.target.value))}>
-                  {providers.map((provider) => (
-                    <option key={provider.id} value={provider.id}>{provider.name} / {provider.model_name}</option>
-                  ))}
-                </select>
+                  <Bot size={15} />
+                  <span className="tool-btn-label model">{selectedProviderLabel}</span>
+                  {selectedProvider ? <span className="tool-btn-detail model">{selectedProvider.name}</span> : null}
+                  <ChevronDown size={14} />
+                </button>
               </div>
+
+              {visibleToolDrawer ? (
+                <div className={`tool-drawer-card ${visibleToolDrawer}`} id="chat-tool-drawer" role="dialog" aria-label="聊天工具设置">
+                  {visibleToolDrawer === 'thinking' ? (
+                    <>
+                      <label className="drawer-toggle-row">
+                        <input
+                          checked={enableThinking}
+                          onChange={(event) => setEnableThinking(event.target.checked)}
+                          type="checkbox"
+                        />
+                        <span>
+                          <strong>深度思考</strong>
+                          <small>{enableThinking ? thinkingEffortLabel(effort) : '关闭'}</small>
+                        </span>
+                      </label>
+                      {enableThinking ? (
+                        <div className="drawer-section">
+                          <div className="drawer-section-title">思考强度</div>
+                          <div className="drawer-segmented" role="group" aria-label="思考强度">
+                            {thinkingEffortOptions.map((option) => (
+                              <button
+                                className={effort === option ? 'active' : ''}
+                                key={option}
+                                onClick={() => setEffort(option)}
+                                type="button"
+                              >
+                                {thinkingEffortLabel(option)}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      ) : null}
+                    </>
+                  ) : null}
+
+                  {visibleToolDrawer === 'search' ? (
+                    <>
+                      <label className="drawer-toggle-row">
+                        <input
+                          checked={enableSearch}
+                          disabled={!selectedProviderSupportsToolCalling}
+                          onChange={(event) => {
+                            setChatError('')
+                            setEnableSearch(event.target.checked)
+                          }}
+                          type="checkbox"
+                        />
+                        <span>
+                          <strong>联网搜索</strong>
+                          <small>{enableSearch ? selectedSearchProviderLabel : '关闭'}</small>
+                        </span>
+                      </label>
+                      <div className="drawer-section">
+                        <div className="drawer-section-title">搜索源</div>
+                        <div className="drawer-option-list">
+                          {searchProviderOptions.map((option) => {
+                            const status = searchProviders?.[option]
+                            const label = searchProviderLabel(option)
+                            const unavailable = status ? !isSearchProviderAvailable(status) : false
+                            return (
+                              <button
+                                className={searchProvider === option ? 'drawer-option active' : 'drawer-option'}
+                                disabled={unavailable}
+                                key={option}
+                                onClick={() => {
+                                  setChatError('')
+                                  setSearchProvider(option)
+                                }}
+                                type="button"
+                              >
+                                <span>
+                                  <strong>{label}</strong>
+                                  <small>{unavailable ? '不可用' : '可用'}</small>
+                                </span>
+                                {searchProvider === option ? <Check size={14} /> : null}
+                              </button>
+                            )
+                          })}
+                        </div>
+                      </div>
+                    </>
+                  ) : null}
+
+                  {visibleToolDrawer === 'provider' ? (
+                    <div className="drawer-section provider-picker">
+                      <div className="provider-picker-current">
+                        <span>当前模型</span>
+                        <strong>{selectedProviderLabel}</strong>
+                        <small>{selectedProvider?.name ?? '未选择供应商'}</small>
+                      </div>
+                      <div className="provider-picker-group-list">
+                        {providerGroups.length ? providerGroups.map((group) => (
+                          <section className="provider-picker-group" key={group.id}>
+                            <div className="provider-picker-heading">
+                              <span className="provider-picker-mark"><Bot size={14} /></span>
+                              <span>
+                                <strong>{group.name}</strong>
+                                <small>{providerApiFormatLabel(group.apiFormat)} / {group.models.length} 个模型</small>
+                              </span>
+                            </div>
+                            <div className="provider-picker-model-list">
+                              {group.models.map((provider) => (
+                                <button
+                                  aria-current={selectedProviderId === provider.id ? 'true' : undefined}
+                                  className={selectedProviderId === provider.id ? 'drawer-option provider-model-option active' : 'drawer-option provider-model-option'}
+                                  key={provider.id}
+                                  onClick={() => {
+                                    applyProviderSelection(provider.id)
+                                    setOpenToolDrawer(null)
+                                  }}
+                                  title={`${provider.name} / ${provider.model_name}`}
+                                  type="button"
+                                >
+                                  <span>
+                                    <strong>{provider.model_name}</strong>
+                                    <small>{modelCapabilityText(provider)}</small>
+                                  </span>
+                                  {selectedProviderId === provider.id ? <Check size={14} /> : null}
+                                </button>
+                              ))}
+                            </div>
+                          </section>
+                        )) : (
+                          <div className="drawer-empty">暂无模型</div>
+                        )}
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
 
               <div className="right-tools">
                 {selectedProvider?.supports_vision ? (
-                  <button className="upload-btn" onClick={triggerFileSelect} type="button">
-                    <Eye size={17} />
+                  <button
+                    aria-label="上传图片"
+                    className="upload-btn"
+                    onClick={() => {
+                      setOpenToolDrawer(null)
+                      triggerFileSelect()
+                    }}
+                    title="上传图片"
+                    type="button"
+                  >
+                    <FileImage size={17} />
                   </button>
                 ) : null}
                 {chatLoading ? (
@@ -407,8 +729,14 @@ export function ChatPage({
                     <Square size={14} />
                   </button>
                 ) : (
-                  <button className="send-btn" disabled={chatLoading || !selectedProviderId} type="submit">
-                    <SendHorizonal size={17} />
+                  <button
+                    aria-label={canSendMessage ? '发送消息' : '消息为空，无法发送'}
+                    className="send-btn"
+                    disabled={!canSendMessage}
+                    title={canSendMessage ? '发送消息' : '输入消息后发送'}
+                    type="submit"
+                  >
+                    <ArrowUp size={17} />
                   </button>
                 )}
               </div>

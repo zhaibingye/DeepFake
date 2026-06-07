@@ -4,8 +4,8 @@ import { api } from '../../api'
 import { normalizeThinkingEffort } from '../../appState'
 import type {
   AdminManagedUser,
+  AdminProviderGroup,
   AdminSettings,
-  Provider,
   SearchProviderAvailability,
   SearchProviderKind,
   User,
@@ -35,7 +35,7 @@ export function buildSearchProviderForms(
 export async function loadAdminDataState(options: {
   token: string
   role?: User['role']
-  setAdminProviders: Dispatch<SetStateAction<Provider[]>>
+  setAdminProviders: Dispatch<SetStateAction<AdminProviderGroup[]>>
   setAdminSearchProviders: Dispatch<SetStateAction<SearchProviderAvailability | null>>
   setSearchProviderForms: Dispatch<
     SetStateAction<Record<SearchProviderKind, SearchProviderFormState>>
@@ -87,7 +87,7 @@ export async function submitProviderState(options: {
 
 export async function removeProviderState(options: {
   token: string
-  provider: Provider
+  provider: AdminProviderGroup
   selectedProviderId: number | null
   applyProviderSelection: (nextProviderId: number | null) => void
   confirmDelete: () => Promise<boolean>
@@ -102,7 +102,7 @@ export async function removeProviderState(options: {
   try {
     await api.deleteProvider(options.token, options.provider.id)
     options.setProviderSuccess('供应商已删除')
-    if (options.selectedProviderId === options.provider.id) {
+    if (options.provider.models.some((model) => model.id === options.selectedProviderId)) {
       options.applyProviderSelection(null)
     }
     await options.refreshAfterDelete()
@@ -111,20 +111,23 @@ export async function removeProviderState(options: {
   }
 }
 
-export function buildEditingProviderForm(provider: Provider): ProviderFormState {
+export function buildEditingProviderForm(provider: AdminProviderGroup): ProviderFormState {
   return {
     name: provider.name,
     api_format: provider.api_format,
     api_url: '',
     api_key: '',
-    model_name: provider.model_name,
-    supports_thinking: provider.supports_thinking,
-    supports_vision: provider.supports_vision,
-    supports_tool_calling: provider.supports_tool_calling,
-    thinking_effort: normalizeThinkingEffort(provider.thinking_effort, provider.api_format),
-    max_context_window: provider.max_context_window,
-    max_output_tokens: provider.max_output_tokens,
-    is_enabled: provider.is_enabled,
+    models: provider.models.map((model) => ({
+      id: model.id,
+      model_name: model.model_name,
+      supports_thinking: model.supports_thinking,
+      supports_vision: model.supports_vision,
+      supports_tool_calling: model.supports_tool_calling,
+      thinking_effort: normalizeThinkingEffort(model.thinking_effort, provider.api_format),
+      max_context_window: model.max_context_window,
+      max_output_tokens: model.max_output_tokens,
+      is_enabled: model.is_enabled,
+    })),
   }
 }
 

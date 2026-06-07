@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { api } from '../../api'
-import type { Provider } from '../../types'
+import type { AdminProviderGroup, Provider } from '../../types'
 import { defaultProviderForm, type ProviderFormState } from './providerForm'
 import { submitProviderState, submitSearchProviderState } from './controller'
 
@@ -32,6 +32,21 @@ function makeProvider(overrides: Partial<Provider> = {}): Provider {
   }
 }
 
+function makeProviderGroup(overrides: Partial<AdminProviderGroup> = {}): AdminProviderGroup {
+  const provider = makeProvider()
+  return {
+    id: provider.connection_id ?? provider.id,
+    name: provider.name,
+    api_format: provider.api_format,
+    model_count: 1,
+    models: [provider],
+    created_at: provider.created_at,
+    updated_at: provider.updated_at,
+    api_key_masked: 'test-key',
+    ...overrides,
+  }
+}
+
 describe('admin provider controller', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -44,8 +59,13 @@ describe('admin provider controller', () => {
       api_format: 'anthropic_messages',
       api_url: 'https://example.test/v1',
       api_key: 'test-key',
-      model_name: 'claude-vision',
-      supports_vision: true,
+      models: [
+        {
+          ...defaultProviderForm.models[0],
+          model_name: 'claude-vision',
+          supports_vision: true,
+        },
+      ],
     }
     const setProviderError = vi.fn()
     const setProviderSuccess = vi.fn()
@@ -53,7 +73,7 @@ describe('admin provider controller', () => {
     const setEditingProviderId = vi.fn()
     const refreshAfterSave = vi.fn().mockResolvedValue(undefined)
 
-    vi.mocked(api.createProvider).mockResolvedValue(makeProvider())
+    vi.mocked(api.createProvider).mockResolvedValue(makeProviderGroup())
 
     await submitProviderState({
       token: 'admin-token',
@@ -68,7 +88,7 @@ describe('admin provider controller', () => {
 
     expect(api.createProvider).toHaveBeenCalledWith('admin-token', providerForm)
     expect(vi.mocked(api.createProvider).mock.calls[0]?.[1]).toMatchObject({
-      supports_vision: true,
+      models: [{ supports_vision: true }],
     })
     expect(api.updateProvider).not.toHaveBeenCalled()
     expect(setProviderError.mock.calls).toEqual([['']])

@@ -26,6 +26,7 @@ export type SetupStatus = {
 
 export type Provider = {
   id: number
+  connection_id?: number
   name: string
   api_format: ProviderApiFormat
   model_name: string
@@ -54,6 +55,17 @@ export type SearchProviderStatus = {
   name?: string
   is_enabled: boolean
   is_configured: boolean
+  api_key_masked?: string
+}
+
+export type AdminProviderGroup = {
+  id: number
+  name: string
+  api_format: ProviderApiFormat
+  model_count: number
+  models: Provider[]
+  created_at: string
+  updated_at: string
   api_key_masked?: string
 }
 
