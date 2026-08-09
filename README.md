@@ -1,3 +1,5 @@
+
+
 # deepfake
 
 一个本地可运行的多用户 AI 聊天控制台。前端使用 Vite + React + TypeScript，后端使用 FastAPI，数据存储使用 SQLite。当前版本支持多供应商接入、流式聊天、思考 / 工具 / 回答时间线、Markdown / LaTeX 渲染、图片输入、联网搜索，以及拆分后的管理员后台。
@@ -301,7 +303,7 @@ curl -X POST http://127.0.0.1:8000/api/setup/admin \
 
 ## 前后端连接说明
 
-前端后端地址通过运行时配置文件设置：
+前端和后端地址通过运行时配置文件设置：
 
 - `frontend/public/config.js`
 
